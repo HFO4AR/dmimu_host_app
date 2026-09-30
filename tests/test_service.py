@@ -61,6 +61,48 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.service.serial.writes, [])
         self.assertEqual(self.service.connection, "connected")
 
+    def test_agent_trajectory_shared_state_exports_and_generation_reset(self):
+        self.service.source = "live"
+        gravity = 9.80665
+        def ingest(stamp, ax=0):
+            raw = encode_frame(1, [ax, 0, gravity]) + encode_frame(2, [0, 0, 0]) + encode_frame(4, [1, 0, 0, 0])
+            self.service._ingest(raw, stamp)
+        ingest(1000)
+        result = self.service._perform("trajectory.reference", {})
+        self.assertFalse(result["device_modified"])
+        for i in range(211): ingest(1000 + i * .01)
+        self.assertIsNotNone(self.service.snapshot()["trajectory"]["reference"])
+        self.service._perform("trajectory.options", {"zupt": False})
+        self.service._perform("trajectory.start", {})
+        for i in range(201): ingest(1003 + i * .01, 1)
+        data = self.service.trajectory_data()
+        self.assertAlmostEqual(data["status"]["position"][0], 2., places=5)
+        self.assertGreater(data["total"], 100)
+        incremental = self.service.trajectory_data(data["total"] - 1, data["epoch"])
+        self.assertEqual(len(incremental["points"]), 1)
+        for kind in ("csv", "mat", "xlsx"):
+            content, _ = self.service.trajectory_export(kind)
+            self.assertTrue(content)
+        self.service._invalidate_reference()
+        reset = self.service.trajectory_data(data["total"], data["epoch"])
+        self.assertEqual(reset["points"], [])
+        self.assertEqual(reset["offset"], 0)
+        self.assertGreater(reset["epoch"], data["epoch"])
+
+    def test_playback_clear_restores_recorded_device_metadata(self):
+        self.service.source = "playback"
+        self.service.playback = {"header": {"device": {"configuration": {"slave_id": 7, "interval_ms": 5}}}}
+        self.service._clear_data()
+        self.assertEqual(self.service.device["configuration"]["slave_id"], 7)
+
+    def test_paused_playback_cannot_start_reference_or_tracking(self):
+        self.service.source = "playback"
+        self.service.playback = {"playing": False}
+        for action in ("trajectory.reference", "trajectory.start"):
+            with self.assertRaises(Fault) as raised:
+                self.service._perform(action, {})
+            self.assertEqual(raised.exception.code, "PLAYBACK_PAUSED")
+
     def test_auto_detection_does_not_select_generic_ports(self):
         self.service.port_provider = lambda: [port(manufacturer="", description="Generic serial")]
         self.service.auto_connect = True
@@ -89,6 +131,40 @@ class ServiceTests(unittest.TestCase):
         channels = self.service.snapshot()["channels"]
         self.assertTrue(channels["acceleration"]["stale"])
         self.assertFalse(channels["euler"]["stale"])
+
+    def test_forwarded_slave_frames_are_counted_without_combining_pose(self):
+        self.service.source = "live"
+        raw = encode_frame(1, [1, 2, 3], slave_id=7) + encode_frame(3, [10, 20, 30], slave_id=8)
+        self.service._ingest(raw, time.time())
+        state = self.service.snapshot()
+        self.assertEqual(state["statistics"]["frames"], 2)
+        self.assertEqual(state["statistics"]["main_slave_id"], 7)
+        self.assertEqual(state["statistics"]["other_slave_frames"], 1)
+        self.assertEqual(state["statistics"]["rx_bytes"], len(raw))
+        self.assertNotIn("euler", state["channels"])
+        self.assertEqual(len(self.service.samples_since(0)["samples"]), 1)
+
+    def test_identifying_actual_slave_invalidates_other_slave_cache(self):
+        self.service.source = "live"
+        self.service._ingest(encode_frame(1, [1, 2, 3], slave_id=7), time.time())
+        before = self.service.generation
+        self.service._apply_device_configuration({"slave_id": 8})
+        self.assertGreater(self.service.generation, before)
+        self.assertFalse(self.service.latest)
+        self.service._ingest(encode_frame(1, [4, 5, 6], slave_id=8), time.time())
+        self.assertEqual(self.service.latest["acceleration"]["slave_id"], 8)
+
+    def test_samples_incremental_order_and_original_replay_clock(self):
+        self.service.source = "playback"
+        from dmimu.protocol import Decoder
+        frame = Decoder().feed(encode_frame(1, [1, 2, 3]))[0]
+        self.service._frame(frame, 200, measurement_time=100)
+        self.service._frame(frame, 201, measurement_time=100.1)
+        rows = self.service.samples_since(1)["samples"]
+        self.assertEqual([row["seq"] for row in rows], [2])
+        self.assertEqual(rows[0]["measurement_time"], 100.1)
+        self.assertEqual(rows[0]["time"], 201)
+        self.assertFalse(self.service.samples_since(2)["samples"])
 
     def test_idempotency_and_restart_preserve_unknown_operations(self):
         first = self.service.submit("demo", {}, "same-key")

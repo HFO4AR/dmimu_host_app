@@ -1,0 +1,30 @@
+// Run with node tests/pose_math.mjs. Pure math; never reads or changes hardware.
+import assert from 'node:assert/strict';
+import * as T from '../static/vendor/three.module.js';
+import {readOrientation,displayQuaternion} from '../static/pose.js';
+const id=new T.Quaternion();
+const near=(a,b)=>assert.ok(a.distanceTo(b)<1e-10,`${a.toArray()} != ${b.toArray()}`);
+const q=new T.Quaternion(),unit=new T.Vector3(1,0,0);
+readOrientation({quaternion:{values:{w:1,x:0,y:0,z:0},stale:false}},q);
+near(unit.clone().applyQuaternion(displayQuaternion(q,id)),new T.Vector3(1,0,0));
+readOrientation({euler:{values:{roll:0,pitch:0,yaw:90},stale:false}},q);
+near(unit.clone().applyQuaternion(displayQuaternion(q,id)),new T.Vector3(0,0,-1));
+readOrientation({euler:{values:{roll:0,pitch:90,yaw:0},stale:false}},q);
+near(unit.clone().applyQuaternion(displayQuaternion(q,id)),new T.Vector3(0,-1,0));
+readOrientation({euler:{values:{roll:90,pitch:0,yaw:0},stale:false}},q);
+near(new T.Vector3(0,1,0).applyQuaternion(displayQuaternion(q,id)),new T.Vector3(0,1,0));
+const a=new T.Quaternion().setFromEuler(new T.Euler(.4,-.2,.8,'ZYX'));
+near(unit.clone().applyQuaternion(displayQuaternion(a,a.clone().invert())),unit);
+assert.equal(readOrientation({quaternion:{values:{w:1,x:0,y:0,z:0},stale:true}},q),null);
+assert.equal(readOrientation({quaternion:{values:{w:0,x:0,y:0,z:0},stale:false}},q),null);
+const e={roll:23,pitch:-11,yaw:48};
+readOrientation({euler:{values:e,stale:false}},q);
+const parsed=new T.Quaternion();
+readOrientation({quaternion:{values:{w:q.w,x:q.x,y:q.y,z:q.z},stale:false}},parsed);
+assert.ok(q.angleTo(parsed)<1e-7);
+// CAD transform columns map a USB-side -Z vector to +device X, and CAD +Y to device +Z.
+const cadRotation=new T.Matrix3().set(0,0,-1,-1,0,0,0,1,0);
+assert.equal(cadRotation.determinant(),1);
+near(new T.Vector3(0,0,-1).applyMatrix3(cadRotation),unit);
+near(new T.Vector3(0,1,0).applyMatrix3(cadRotation),new T.Vector3(0,0,1));
+console.log('Pose coordinate math passed');

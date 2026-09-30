@@ -12,6 +12,10 @@ htmlcov/
 .coverage*
 # Local device data, credentials and recordings
 data/
+exports/
+analyses/
+firmware/
+protocol-probes/
 .env
 .env.*
 !.env.example
@@ -33,3 +37,20 @@ test-results/
 tmp/
 .DS_Store
 Thumbs.db
+
+# Downloaded vendor executables and analysis artifacts
+downloads/
+# Official CAD conversion and local firmware/evidence caches
+*.STEP
+*.step
+*.stp
+*.mesh
+*.bin
+*.pdb
+*.exe
+*.imulog.csv
+physical-*.json
+physical-*.csv
+physical-*.png
+*.mat
+*.xlsx

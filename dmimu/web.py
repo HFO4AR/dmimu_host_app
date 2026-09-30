@@ -10,6 +10,8 @@ import secrets
 import socket
 import signal
 import time
+import threading
+from io import BytesIO
 from urllib.parse import urlsplit
 
 from flask import Flask, Response, jsonify, request, send_file, session
@@ -19,6 +21,11 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from . import __version__
 from .service import Fault, Service
 from .storage import InstanceLock, Settings, atomic_json, default_directory
+from .waveform_export import export as export_waveform
+from .model import create_model_blueprint
+from .trajectory_export import export as export_trajectory
+from .spectrum_export import export as export_spectrum
+from .firmware import MAX_PACKAGE_SIZE
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -33,9 +40,11 @@ def local_request():
 
 def create_app(settings, service):
     app = Flask(__name__, static_folder=str(ROOT / "static"), static_url_path="/static")
+    app.register_blueprint(create_model_blueprint())
     app.secret_key = settings.values["secret"]
     app.config.update(MAX_CONTENT_LENGTH=65536, SESSION_COOKIE_NAME="dmimu_session", SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Strict")
     attempts = {}
+    import_lock = threading.Lock()
 
     @app.errorhandler(Fault)
     def fault(exc):
@@ -59,6 +68,16 @@ def create_app(settings, service):
 
     @app.before_request
     def authorize():
+        if request.path in {"/api/v1/firmware/upload", "/api/agent/v1/firmware/upload"}:
+            request.max_content_length = MAX_PACKAGE_SIZE
+        if request.path in {"/api/v1/spectra/export", "/api/agent/v1/spectra/export"}:
+            request.max_content_length = 4 * 1024 * 1024
+        if request.path in {"/api/v1/recordings/import", "/api/agent/v1/recordings/import"}:
+            request.max_content_length = 1024 * 1024 * 1024
+        if request.path in {"/api/v1/waveforms/export", "/api/agent/v1/waveforms/export"}:
+            request.max_content_length = 48 * 1024 * 1024
+        if request.path in {"/api/v1/trajectories/export", "/api/agent/v1/trajectories/export"}:
+            request.max_content_length = 8 * 1024 * 1024
         if request.method in {"POST", "PUT", "DELETE", "PATCH"}:
             origin = request.headers.get("Origin")
             if origin and origin.rstrip("/") != request.host_url.rstrip("/"):
@@ -130,8 +149,47 @@ def create_app(settings, service):
         tag = "agent" if "agent" in prefix else "browser"
         app.add_url_rule(prefix + "/capabilities", tag + "_capabilities", lambda: result(service.capabilities()), methods=["GET"])
         app.add_url_rule(prefix + "/status", tag + "_status", lambda: result(service.snapshot()), methods=["GET"])
+        def trajectory_data():
+            try:
+                after = int(request.args.get("after", "0"))
+                epoch = int(request.args["epoch"]) if "epoch" in request.args else None
+            except ValueError:
+                raise Fault("INVALID_PARAMS", "轨迹索引必须是整数")
+            return result(service.trajectory_data(after, epoch))
+        app.add_url_rule(prefix + "/trajectory", tag + "_trajectory_data", trajectory_data, methods=["GET"])
+
+        def current_trajectory_export(kind):
+            content, mimetype = service.trajectory_export(kind)
+            name = "dmimu-trajectory-" + time.strftime("%Y%m%d-%H%M%S") + "." + kind
+            return send_file(BytesIO(content), mimetype=mimetype, as_attachment=True, download_name=name)
+        app.add_url_rule(prefix + "/trajectory/<kind>", tag + "_current_trajectory_export", current_trajectory_export, methods=["GET"])
         app.add_url_rule(prefix + "/ports", tag + "_ports", lambda: result(service.ports()), methods=["GET"])
         app.add_url_rule(prefix + "/recordings", tag + "_recordings", lambda: result(service.recordings.listing()), methods=["GET"])
+
+        def firmware_upload():
+            if request.mimetype != "application/octet-stream":
+                raise Fault("INVALID_CONTENT_TYPE", "固件上传需要 application/octet-stream")
+            raw = request.stream.read(MAX_PACKAGE_SIZE + 1)
+            return result(service.store_firmware(raw, request.headers.get("X-Firmware-Name", "firmware.bin")))
+        app.add_url_rule(prefix + "/firmware/upload", tag + "_firmware_upload", firmware_upload, methods=["POST"])
+        app.add_url_rule(prefix + "/firmware", tag + "_firmware_list", lambda: result(service.firmware_listing()), methods=["GET"])
+        app.add_url_rule(prefix + "/firmware/<identifier>", tag + "_firmware_inspect", lambda identifier: result(service.inspect_firmware(identifier)), methods=["GET"])
+
+        def recording_import():
+            if not import_lock.acquire(blocking=False):
+                raise Fault("IMPORT_BUSY", "已有录制导入正在处理", 409)
+            try:
+                return result(service.recordings.import_stream(request.stream))
+            finally:
+                import_lock.release()
+        app.add_url_rule(prefix + "/recordings/import", tag + "_recording_import", recording_import, methods=["POST"])
+
+        def spectrum_export():
+            data = body()
+            content, mimetype = export_spectrum(data)
+            name = "dmimu-spectrum-" + time.strftime("%Y%m%d-%H%M%S") + "." + data["format"]
+            return send_file(BytesIO(content), mimetype=mimetype, as_attachment=True, download_name=name)
+        app.add_url_rule(prefix + "/spectra/export", tag + "_spectrum_export", spectrum_export, methods=["POST"])
 
         def samples():
             return result(service.samples_since(int(request.args.get("after", "0"))))
@@ -141,6 +199,42 @@ def create_app(settings, service):
             with service.lock:
                 return result(list(service.logs))
         app.add_url_rule(prefix + "/logs", tag + "_logs", logs, methods=["GET"])
+
+        def waveform_export():
+            data = body()
+            content, mimetype = export_waveform(data)
+            name = "dmimu-waveform-" + time.strftime("%Y%m%d-%H%M%S") + "." + data["format"]
+            return send_file(BytesIO(content), mimetype=mimetype, as_attachment=True, download_name=name)
+        app.add_url_rule(prefix + "/waveforms/export", tag + "_waveform_export", waveform_export, methods=["POST"])
+
+        def trajectory_export():
+            data = body()
+            content, mimetype = export_trajectory(data)
+            name = "dmimu-trajectory-" + time.strftime("%Y%m%d-%H%M%S") + "." + data["format"]
+            return send_file(BytesIO(content), mimetype=mimetype, as_attachment=True, download_name=name)
+        app.add_url_rule(prefix + "/trajectories/export", tag + "_trajectory_export", trajectory_export, methods=["POST"])
+
+        def analysis(identifier, kind="json"):
+            import re
+            import csv
+            from io import StringIO
+            if not re.fullmatch(r"[0-9a-f]{32}", identifier):
+                raise Fault("INVALID_ID", "无效分析 ID")
+            path = settings.directory / "analyses" / (identifier + ".json")
+            if not path.is_file():
+                raise Fault("FILE_NOT_FOUND", "分析结果不存在", 404)
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if kind == "json":
+                return result(data)
+            if kind != "csv":
+                raise Fault("INVALID_FORMAT", "分析结果支持 json 或 csv")
+            out = StringIO(newline="");writer = csv.writer(out)
+            writer.writerow(("tau_s", "m", "pairs", "adev_x", "adev_y", "adev_z", "unit", "sample_rate_hz", "recording_id", "channel"))
+            for point in data["points"]:
+                writer.writerow((point["tau_s"], point["m"], point["pairs"], *(point["deviation"][axis] for axis in ("x", "y", "z")), data["unit"], data["sample_rate_hz"], data["recording_id"], data["channel"]))
+            return send_file(BytesIO(b"\xef\xbb\xbf" + out.getvalue().encode()), mimetype="text/csv", as_attachment=True, download_name="dmimu-allan-" + identifier[:8] + ".csv")
+        app.add_url_rule(prefix + "/analyses/<identifier>", tag + "_analysis", analysis, methods=["GET"])
+        app.add_url_rule(prefix + "/analyses/<identifier>/<kind>", tag + "_analysis_download", analysis, methods=["GET"])
 
         def action():
             data = body()
@@ -153,10 +247,15 @@ def create_app(settings, service):
         app.add_url_rule(prefix + "/operations/<identifier>", tag + "_operation", operation, methods=["GET"])
 
         def download(identifier, kind):
-            if kind not in {"raw", "csv"}:
-                raise Fault("INVALID_FORMAT", "仅支持 raw 和 csv")
+            if kind not in {"raw", "csv", "imulog"}:
+                raise Fault("INVALID_FORMAT", "支持 raw、csv 和 imulog")
             if identifier == service.recordings.active:
                 raise Fault("RECORDING_ACTIVE", "先停止录制，再下载")
+            if kind == "imulog":
+                # Validate synchronously before entering a streamed response.
+                if not service.recordings.path(identifier).is_file():
+                    raise Fault("FILE_NOT_FOUND", "录制文件不存在", 404)
+                return Response(service.recordings.official_export(identifier), mimetype="application/octet-stream", headers={"Content-Disposition": 'attachment; filename="' + identifier + '.imulog"'})
             path = service.recordings.path(identifier, "csv" if kind == "csv" else "dmimulog")
             if not path.is_file():
                 raise Fault("FILE_NOT_FOUND", "文件不存在；CSV 需要先导出", 404)
@@ -189,7 +288,7 @@ def create_app(settings, service):
     def update_settings():
         if not local_request():
             raise Fault("LOCAL_ONLY", "接入、协议和服务器设置只允许本机页面修改", 403)
-        if service.recordings.writer or service.jobs.unfinished_tasks:
+        if service.recordings.writer or service.jobs.unfinished_tasks or service.calibration_poll:
             raise Fault("BUSY", "先停止录制并等待操作完成，再修改上位机设置", 409)
         p = body()
         allowed = {"lan_enabled", "password", "agent_enabled", "regenerate_agent_token", "auto_connect", "baudrate", "protocol", "legacy_crc"}

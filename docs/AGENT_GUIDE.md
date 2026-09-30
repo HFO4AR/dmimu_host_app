@@ -51,36 +51,107 @@ python3 agent_cli.py recordings
 python3 agent_cli.py action record.export --params '{"id":"RECORDING_ID"}' --idempotency-key export-001
 python3 agent_cli.py download RECORDING_ID --format csv --output /tmp/imu.csv
 python3 agent_cli.py download RECORDING_ID --format raw --output /tmp/imu.dmimulog
+python3 agent_cli.py download RECORDING_ID --format imulog --output /tmp/imu.imulog
+python3 agent_cli.py recording-import --input /private/official.imulog
 python3 agent_cli.py action playback.open --params '{"id":"RECORDING_ID"}' --idempotency-key replay-001
 python3 agent_cli.py action playback.control --params '{"playing":true,"speed":2}' --idempotency-key play-001
 python3 agent_cli.py action playback.control --params '{"position":1.2,"playing":false}' --idempotency-key seek-001
 ```
 
+官方 `.imulog` 二进制容器和工作台 `.dmimulog` 支持导入；native 格式已对照官方读写机器码并进行合成 roundtrip，尚未在 Windows 官方 EXE 中实测打开工作台导出的文件。导入大小1GiB；详情见 [录制格式](RECORDINGS.md)。
+
 先停止录制再导出、下载或切换来源。下载拒绝覆盖现有文件。回放会释放真实串口并暂停自动连接；恢复采集需显式 `connect`。
 
-原始单位：加速度 m/s²、角速度 rad/s、欧拉角 deg、四元数 w/x/y/z、温度 °C。API 时间是主机接收 Unix 秒，不是设备同步时间；不要把不同通道更新时间当成同一采样时刻。
+原始单位：加速度 m/s²、角速度 rad/s、欧拉角 deg、四元数 w/x/y/z、温度 °C。`time` 是当前服务接收 Unix 秒，`measurement_time` 在回放中保留录制时的原始接收时间；分析回放时优先使用后者，倍速不改变物理时基。两者都不是设备同步时钟；不要把不同通道更新时间当成同一采样时刻。
 
-## 设备控制与协议探测
+## 新版设备读取与控制
 
-先检查 `capabilities.data.device_control`。默认 `auto` 仅接收，2.x 写指令尚未支持。只有用户在本机页面确认 1.x 固件并选择 `legacy-v1` 后开放公开旧指令。
+先检查 `capabilities.data.device_control`。默认连接被动接收，显式 `device.inspect` 通过已核实的新版只读指令读取 Boot/APP 版本、配置、静止和六面状态，确认 APP>=2 才开放新版写能力。版本未知不会套用旧控制。
 
 ```bash
+python3 agent_cli.py action device.inspect --idempotency-key inspect-001
 python3 agent_cli.py action device.read-settings --idempotency-key settings-read-001
+python3 agent_cli.py action device.calibration-status --idempotency-key calibration-status-001
+```
+
+以下示例只说明调用格式；实际设备修改应在用户已授权具体操作后执行：
+
+```bash
 python3 agent_cli.py action device.configure --params '{"interval_ms":10,"euler_enabled":true}' --idempotency-key configure-001
 python3 agent_cli.py action device.calibrate --params '{"kind":"gyro","acknowledged":true}' --idempotency-key gyro-calibrate-001
 python3 agent_cli.py action device.calibrate --params '{"kind":"six-face","acknowledged":true}' --idempotency-key six-face-001
-python3 agent_cli.py action device.angle-zero --params '{"acknowledged":true}' --idempotency-key angle-zero-001
+python3 agent_cli.py action device.calibration-abort --params '{"acknowledged":true}' --idempotency-key six-abort-001
+python3 agent_cli.py action device.yaw-zero --params '{"acknowledged":true}' --idempotency-key yaw-zero-001
+python3 agent_cli.py action device.factory-reset --params '{"acknowledged":true}' --idempotency-key factory-001
 ```
 
-`device.configure` 接受四个通道开关、`interval_ms`、`heating_enabled` 和 `target_temperature`。先校验全部参数，再进入设置模式发送指令。回读成功只证明当前状态匹配；`persistent_storage_verified` 始终为 false，断电保存需另行实测。
+V2 `device.configure` 接受：acceleration_enabled、gyro_enabled、euler_enabled、quaternion_enabled、can_active、interval_ms、heating_enabled、target_temperature、slave_id、master_id、communication、can_baudrate、uart_baudrate、installation_rotation、accel_range、gyro_range。取值与能力见 [V2协议](V2_PROTOCOL.md)。安装方向/量程仅在当前固件回报这些字段时可改。切换接口可能停止 USB 测量。
 
-旧校准协议缺少完成回报，状态会是 `uncertain`。观察实际设备指示灯和后续测量，不能把指令发送当作校准成功。`device.yaw-zero` 不会用旧版角度置零替代，返回不支持。
+全部参数先校验，进入设置模式后逐条等待ACK，再回读匹配才保存。`persistent_storage_verified=false`；保存确认不证明断电存储。改变安装方向/量程需重新校准并重新建立轨迹参考。
 
-用户授权协议调查时，可执行有界探测：
+校准启动终态成功不代表物理完成：result中的 `started=true,completed=false` 只表示设备接受开始。后台读取校准状态，或调用 `device.calibration-status`；state=3/4分别为设备完成/失败，核对结果有效标记/error。超时、中断返回 `uncertain`，不重发。六面取消是独立已确认命令。
+
+旧版1.x仅在本机页面明确选择 `legacy-v1` 后开放历史公开指令；无完成回报时校准返回 uncertain。`device.angle-zero` 是旧版角度置零，不替代新版独立航向归零。
+
+## Allan 分析与数据导出
+
+```bash
+python3 agent_cli.py --timeout 600 action allan.analyze --params '{"recording_id":"RECORDING_ID","channel":"angular_velocity","sample_rate":1000}' --idempotency-key allan-001 --no-wait
+python3 agent_cli.py operation ANALYSIS_OPERATION_ID
+python3 agent_cli.py action allan.cancel --params '{"operation_id":"ANALYSIS_OPERATION_ID"}' --idempotency-key allan-cancel-001
+```
+
+分析采用已完成原始录制，sample_rate填写录制时标称输出频率；不把USB批量到达时间反推为同步设备时钟。操作progress显示阶段，完成后result.id标识 `/api/agent/v1/analyses/ID` JSON及 `/csv` 附件。取消请求不是分析完成，继续查原操作。
+
+波形 `/waveforms/export`、频谱 `/spectra/export`、估算轨迹 `/trajectories/export` 支持 MAT/XLSX/CSV 二进制下载，使用同一 Agent Bearer 认证。payload与大小见 [API](API.md)。CLI已封装文件响应并拒绝覆盖：
+
+```bash
+python3 agent_cli.py analysis-download ANALYSIS_ID --format csv --output /private/allan.csv
+python3 agent_cli.py waveform-export --input /private/waveform.json --format mat --output /private/waveform.mat
+python3 agent_cli.py spectrum-export --input /private/spectrum.json --format xlsx --output /private/spectrum.xlsx
+python3 agent_cli.py trajectory-export --input /private/trajectory.json --format csv --output /private/trajectory.csv
+```
+
+输入JSON携带该接口需要的原始数组和元数据，CLI按 `--format` 选择文件类型，不改变数值。网页显示单位不改变导出原始单位。
+
+## Agent 持续三维轨迹
+
+Service 是唯一常驻估计器，网页和 Agent 共用相同状态。关闭网页不会终止已显式启动的任务；来源变化、重连或回放跳转清空参考与点集。没有数据会由服务watchdog停止，位置不会被无限外推。
+
+```bash
+python3 agent_cli.py action trajectory.reference --idempotency-key trajectory-ref-001
+python3 agent_cli.py status
+python3 agent_cli.py action trajectory.start --idempotency-key trajectory-start-001
+python3 agent_cli.py action trajectory.options --params '{"zupt":false}' --idempotency-key trajectory-zupt-001
+python3 agent_cli.py action trajectory.pause --idempotency-key trajectory-pause-001
+python3 agent_cli.py trajectory-download --format mat --output /private/trajectory.mat
+python3 agent_cli.py action trajectory.reset --idempotency-key trajectory-reset-001
+```
+
+先固定模块，在live或播放中的recorded数据上建立静止参考；status.trajectory.reference有效后再start。reference/start的命令成功不代表已有有效轨迹点，检查active/calibrating/referenceProgress/message。没有外部位置真值不能声称绝对定位精度。零速更新假设实际静止，匀速平移可能被误判，options可关闭。
+
+`GET /api/agent/v1/trajectory?after=INDEX&epoch=EPOCH`提供增量点与状态；epoch改变时清空客户端缓存。`GET /api/agent/v1/trajectory/csv|mat|xlsx`只读导出服务当前点集。POST离线导出仍接受source、generation、原始时基与estimate=true；不能用离线文件代替正在运行任务状态。
+
+## 固件
+
+固件包可先上传并读取元数据，不触发设备擦写：
+
+```bash
+python3 agent_cli.py firmware-upload --input /private/dm_imu_app_v2.0.4.0.bin
+python3 agent_cli.py action firmware.inspect --params '{"id":"FIRMWARE_ID"}' --idempotency-key firmware-inspect-001
+```
+
+已获得具体升级授权后，`firmware.upgrade`参数为id、acknowledged=true、expected_version（当前设备版本）、expected_identity（ports中确认的USB身份）。设备与版本必须与确认时相同，候选包严格高于设备版本；仅开放已确认2.x。`firmware.cancel`接受原upgrade的operation_id。包格式、ACK/取消、重连版本核验和实机未刷写边界见 [固件说明](FIRMWARE.md)。上传/解析不等于开始擦写，分页进度不是最终成功。
+
+## 有界协议调查
+
+用户授权协议调查时，可执行固定旧版查询：
 
 ```bash
 python3 agent_cli.py action protocol.probe --params '{"acknowledged":true}' --idempotency-key protocol-probe-001
 python3 agent_cli.py probe-download PROBE_ID --output /tmp/imu-probe.json
 ```
 
-此操作会暂时进入设置模式，最多三次发送已公开状态查询，再退出；最多保存 2 MiB 原始接收数据。返回 `state_report_observed`、帧类型、是否截断等证据，不自动判定固件版本或开放参数写入。没有设备时返回 `NOT_LIVE`。不提供任意串口写入或命令 ID 穷举接口。
+此操作暂时进入设置模式，最多三次已公开状态查询再退出，最多2MiB原始接收数据。不穷举未知命令，不修改参数/保存，也不自动由旧应答识别新版能力。正常V2读取使用device.inspect。没有真实设备返回NOT_LIVE。
+
+具体设备应答、传感器记录、Token、用户照片和本机固件都保留私有目录，不随源码推送。

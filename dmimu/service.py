@@ -1,6 +1,5 @@
 """Single serial owner, telemetry, reconnect, recordings and serialized actions."""
 import base64
-import bisect
 from collections import deque
 import copy
 import hashlib
@@ -17,7 +16,11 @@ from serial.tools import list_ports
 
 from .protocol import Decoder, UNITS, encode_frame
 from .recordings import Recordings
+from .playback import StreamingPlayback
 from .storage import atomic_json
+from . import v2
+from .firmware_runtime import FirmwareRuntime
+from .trajectory import TrajectoryEstimator
 
 
 class Fault(Exception):
@@ -26,8 +29,8 @@ class Fault(Exception):
         self.code, self.status = code, status
 
 
-class Service:
-    ACTIONS = ("connect", "disconnect", "demo", "record.start", "record.stop", "record.export", "playback.open", "playback.control", "device.configure", "device.calibrate", "device.angle-zero", "device.yaw-zero", "device.read-settings", "protocol.probe")
+class Service(FirmwareRuntime):
+    ACTIONS = ("connect", "disconnect", "demo", "record.start", "record.stop", "record.export", "playback.open", "playback.control", "device.configure", "device.calibrate", "device.calibration-abort", "device.factory-reset", "device.angle-zero", "device.yaw-zero", "device.read-settings", "device.inspect", "device.calibration-status", "protocol.probe", "allan.analyze", "allan.cancel", "firmware.inspect", "firmware.upgrade", "firmware.cancel", "device.build-info", "device.restart", "trajectory.reference", "trajectory.start", "trajectory.pause", "trajectory.reset", "trajectory.options")
 
     def __init__(self, settings, serial_factory=serial.Serial, port_provider=list_ports.comports):
         self.settings = settings
@@ -37,7 +40,17 @@ class Service:
         self.stop_event = threading.Event()
         self.reader = self.worker = None
         self.jobs = queue.Queue(maxsize=32)
-        self.decoder = Decoder(settings.values["legacy_crc"])
+        self.analysis_jobs = queue.Queue(maxsize=4)
+        self.analysis_worker = None
+        self.analysis_cancel = {}
+        self.decoder = Decoder(settings.values["legacy_crc"], self._control_ack)
+        self.control_condition = threading.Condition(self.lock)
+        self._init_firmware()
+        self.control_sequence = 0
+        self.control_replies = deque(maxlen=64)
+        self.device = {}
+        self.calibration_poll = None
+        self.device_restarting = False
         self.serial = None
         self.port = None
         self.identity = None
@@ -52,6 +65,13 @@ class Service:
         self.generation = 0
         self.logs = deque(maxlen=300)
         self.receive_times = {}
+        self.rx_bytes = 0
+        self.rx_window = deque(maxlen=8192)
+        self.slave_frames = {}
+        self.main_slave_id = None
+        self.trajectory = TrajectoryEstimator()
+        self.trajectory_epoch = 0
+        self.trajectory.set_source(self.source, self.generation)
         self.recordings = Recordings(settings.directory)
         self.record_error = None
         self.playback = None
@@ -70,15 +90,24 @@ class Service:
     def start(self):
         self.reader = threading.Thread(target=self._reader, name="imu-reader", daemon=True)
         self.worker = threading.Thread(target=self._worker, name="imu-operations", daemon=True)
+        self.analysis_worker = threading.Thread(target=self._worker, args=(self.analysis_jobs,), name="imu-analysis", daemon=True)
         self.reader.start()
         self.worker.start()
+        self.analysis_worker.start()
 
     def close(self):
         self.stop_event.set()
+        self.firmware_cancel.set()
+        with self.lock:
+            cancellations = list(self.analysis_cancel.values())
+        for cancel in cancellations:
+            cancel.set()
         if self.reader:
             self.reader.join(timeout=2)
         if self.worker:
             self.worker.join()
+        if self.analysis_worker:
+            self.analysis_worker.join()
         with self.lock:
             if self.recordings.writer:
                 self.recordings.stop()
@@ -100,9 +129,11 @@ class Service:
 
     def capabilities(self):
         legacy = self.settings.values["protocol"] == "legacy-v1"
+        modern = not legacy and self.device.get("protocol") == "v2"
         return {"version": "1", "model": "DM-IMU-L1", "actions": list(self.ACTIONS), "single_device": True, "sources": ["live", "demo", "playback"], "units": UNITS,
+                "firmware": {"upload_limit": 4096 * 255 + 18, "requires_acknowledged": True, "requires_expected_version": True, "requires_expected_identity": True, "minimum_app_major": 2, "hardware_flash_verified": False, "completion_verification": "post-reboot-version-readback"},
                 "protocol_probe": {"experimental": True, "requests": "V1 documented setting-status request only", "requires_acknowledged": True},
-                "device_control": {"profile": self.settings.values["protocol"], "supported": legacy, "verification": "legacy-status-frame" if legacy else "unavailable", "calibration_result_available": False, "reason": None if legacy else "新版 2.x 控制协议未公开；确认设备为 1.x 后可在网页选择旧版协议", "unsupported": ["installation_rotation", "sensor_range", "v2_configuration", "v2_calibration"]}}
+                "device_control": {"profile": "v2" if modern else self.settings.values["protocol"], "supported": legacy or modern, "verification": "device-ack-and-readback" if modern else ("legacy-status-frame" if legacy else "unavailable"), "calibration_result_available": modern, "reason": None if legacy or modern else "点击读取设备版本，确认新版协议；旧版 1.x 可在网页选择旧版协议", "unsupported": [] if modern else ["installation_rotation", "sensor_range", "v2_configuration", "v2_calibration"]}}
 
     def snapshot(self):
         now = time.time()
@@ -116,18 +147,60 @@ class Service:
             replay = None
             if self.playback:
                 replay = {k: self.playback[k] for k in ("id", "position", "duration", "playing", "speed")}
-            return {"source": self.source, "generation": self.generation, "connection": self.connection, "port": self.port, "error": self.error, "seq": self.seq, "host_time": now, "channels": channels, "auto_connect": self.auto_connect,
-                    "statistics": {"frames": self.decoder.frames, "crc_errors": self.decoder.crc_errors, "discarded_bytes": self.decoder.discarded_bytes, "uptime_s": time.monotonic() - self.started},
-                    "recording": {"id": self.recordings.active, "bytes": self.recordings.bytes, "error": self.record_error}, "playback": replay}
+            self._trim_rx_window()
+            self._trajectory_watchdog()
+            return {"source": self.source, "generation": self.generation, "connection": self.connection, "port": self.port, "identity": self.identity, "error": self.error, "seq": self.seq, "host_time": now, "channels": channels, "auto_connect": self.auto_connect,
+                    "statistics": {"frames": self.decoder.frames, "crc_errors": self.decoder.crc_errors, "discarded_bytes": self.decoder.discarded_bytes, "control_frames": self.decoder.control_frames, "rx_bytes": self.rx_bytes, "rx_bytes_per_s": sum(size for _, size in self.rx_window), "main_slave_id": self.main_slave_id, "slave_frames": dict(self.slave_frames), "other_slave_frames": sum(count for key, count in self.slave_frames.items() if key != str(self.main_slave_id)), "uptime_s": time.monotonic() - self.started},
+                    "device": copy.deepcopy(self.device), "trajectory": self.trajectory.snapshot() | {"epoch": self.trajectory_epoch}, "firmware": copy.deepcopy(self.firmware_status), "firmware_busy": self.firmware_reserved is not None, "device_busy": self.firmware_reserved is not None or self.device_restarting, "recording": {"id": self.recordings.active, "bytes": self.recordings.bytes, "error": self.record_error}, "playback": replay}
+
+    def _trajectory_watchdog(self):
+        if self.trajectory.set_source(self.source, self.generation):
+            self.trajectory_epoch += 1
+        if self.source == "playback" and self.playback and not self.playback["playing"]:
+            if self.trajectory.active or self.trajectory.calibrating:
+                self.trajectory.pause("回放已暂停；恢复回放后手动继续追踪")
+        self.trajectory.check_idle()
+
+    def _consume_trajectory(self, samples):
+        self._trajectory_watchdog()
+        self.trajectory.consume([item for item in samples if item is not None])
+
+    def trajectory_data(self, after=0, epoch=None):
+        if type(after) is not int or not 0 <= after <= 12000:
+            raise ValueError("轨迹 after 必须为 0–12000 的点索引")
+        with self.lock:
+            self._trajectory_watchdog()
+            if epoch is not None and epoch != self.trajectory_epoch:
+                after = 0
+            total = len(self.trajectory.points)
+            if after > total: after = 0
+            return {"status": self.trajectory.snapshot() | {"epoch": self.trajectory_epoch},
+                    "epoch": self.trajectory_epoch, "points": copy.deepcopy(self.trajectory.points[after:]),
+                    "offset": after, "next": total, "total": total, "generation": self.generation}
+
+    def trajectory_export(self, kind):
+        from .trajectory_export import export
+        with self.lock:
+            self._trajectory_watchdog()
+            payload = self.trajectory.export_payload(kind)
+        return export(payload)
 
     def samples_since(self, after=0):
         with self.lock:
-            data = [s for s in self.history if s["seq"] > after]
+            data = []
+            for sample in reversed(self.history):
+                if sample["seq"] <= after:
+                    break
+                data.append(sample)
+            data.reverse()
             return {"samples": data, "generation": self.generation, "seq": self.seq, "truncated": bool(self.history and after and after < self.history[0]["seq"] - 1)}
 
     def _ingest(self, raw, stamp, link=None):
         with self.lock:
             if link is not None and link is not self.serial:
+                return
+            self._count_rx(len(raw))
+            if self._capture_firmware(raw):
                 return
             if self.probe_capture is not None:
                 capture = self.probe_capture
@@ -147,14 +220,24 @@ class Service:
                         self.recordings.writer = None
                         self.recordings.active = None
                     self.log("录制写入失败，已停止：" + str(exc), "error")
-            for frame in self.decoder.feed(raw):
-                self._frame(frame, stamp)
+            batch = [self._frame(frame, stamp) for frame in self.decoder.feed(raw)]
+            self._consume_trajectory(batch)
 
-    def _frame(self, frame, stamp):
-        self.seq += 1
+    def _frame(self, frame, stamp, measurement_time=None):
+        key = str(frame.slave_id)
+        self.slave_frames[key] = self.slave_frames.get(key, 0) + 1
         if self.source == "playback":
             self.decoder.frames += 1
-        item = {"seq": self.seq, "time": stamp, "channel": frame.channel, "values": frame.values, "slave_id": frame.slave_id}
+            self._count_rx(len(frame.raw))
+        configured = self.device.get("configuration", {}).get("slave_id")
+        if self.main_slave_id is None:
+            self.main_slave_id = configured if type(configured) is int and 0 <= configured <= 255 else frame.slave_id
+        # Forwarded bus frames must not be combined into a single attitude or
+        # integrated trajectory. They remain in recordings and receive counts.
+        if frame.slave_id != self.main_slave_id:
+            return
+        self.seq += 1
+        item = {"seq": self.seq, "time": stamp, "measurement_time": stamp if measurement_time is None else measurement_time, "channel": frame.channel, "values": frame.values, "slave_id": frame.slave_id}
         self.latest[frame.channel] = {"values": frame.values, "updated_at": stamp, "unit": UNITS.get(frame.channel, ""), "slave_id": frame.slave_id, "frame_length": len(frame.raw)}
         times = self.receive_times.setdefault(frame.channel, deque(maxlen=2000))
         times.append(stamp)
@@ -162,13 +245,49 @@ class Service:
         if self.source == "live":
             self.connection = "streaming"
             self.error = None
+        return item
 
-    def _clear_data(self):
+    def _apply_device_configuration(self, configuration):
+        old = self.device.get("configuration", {})
+        keys = ("installation_rotation", "accel_range", "gyro_range", "slave_id")
+        changed = any(key in old and old.get(key) != configuration.get(key) for key in keys)
+        if changed or self.main_slave_id is not None and self.main_slave_id != configuration.get("slave_id"):
+            self._invalidate_reference()
+        self.device.update(configuration=configuration, updated_at=time.time())
+
+    def _invalidate_reference(self):
+        # Coordinate/range/calibration changes invalidate browser zero references.
         self.generation += 1
         self.latest.clear()
         self.receive_times.clear()
         self.history.clear()
-        self.decoder = Decoder(self.settings.values["legacy_crc"])
+        self.main_slave_id = None
+        if hasattr(self, "trajectory") and self.trajectory.set_source(self.source, self.generation):
+            self.trajectory_epoch += 1
+
+    def _clear_data(self):
+        self._invalidate_reference()
+        self.decoder = Decoder(self.settings.values["legacy_crc"], self._control_ack)
+        self.device = {}
+        self.calibration_poll = None
+        self.control_replies.clear()
+        self.rx_bytes = 0
+        self.rx_window.clear()
+        self.slave_frames.clear()
+        if self.source == "playback" and self.playback:
+            recorded = self.playback.get("header", {}).get("device", {})
+            if isinstance(recorded, dict):
+                self.device = copy.deepcopy(recorded)
+
+    def _trim_rx_window(self):
+        cutoff = time.monotonic() - 1
+        while self.rx_window and self.rx_window[0][0] < cutoff:
+            self.rx_window.popleft()
+
+    def _count_rx(self, size):
+        self.rx_bytes += size
+        self.rx_window.append((time.monotonic(), size))
+        self._trim_rx_window()
 
     def _close_serial(self):
         if self.serial:
@@ -217,7 +336,7 @@ class Service:
                         self._ingest(raw, time.time(), link)
                     with self.lock:
                         latest_time = max((v["updated_at"] for v in self.latest.values()), default=self.connected_at)
-                        if time.time() - latest_time > 2:
+                        if not (self.firmware_reserved or self.device_restarting) and time.time() - latest_time > 2:
                             self.connection = "no-data"
                             self.error = "串口已打开，但超过两秒没有有效数据；检查输出接口、通道和固件配置"
                 elif source == "demo":
@@ -232,7 +351,7 @@ class Service:
                     self.stop_event.wait(.01)
                 else:
                     now = time.monotonic()
-                    if self.auto_connect and now >= self.next_scan:
+                    if not (self.firmware_reserved or self.device_restarting) and self.auto_connect and now >= self.next_scan:
                         self.next_scan = now + 2
                         ports = self.ports()
                         preferred = self.settings.values["preferred_device"]
@@ -272,14 +391,39 @@ class Service:
                 if previous["signature"] != signature:
                     raise Fault("IDEMPOTENCY_CONFLICT", "相同幂等键对应不同操作", 409)
                 return copy.deepcopy(previous)
+            if (self.firmware_reserved or self.device_restarting) and action not in {"firmware.cancel", "firmware.inspect", "allan.analyze", "allan.cancel", "record.export"}:
+                raise Fault("FIRMWARE_BUSY", "升级或重启占用设备；完成前不能切换、录制或配置", 409)
+            if action == "firmware.cancel":
+                if set(params) != {"operation_id"} or params["operation_id"] != self.firmware_reserved:
+                    raise Fault("UPGRADE_NOT_RUNNING", "指定升级操作未运行", 409)
+                self.firmware_cancel.set()
+                self.firmware_condition.notify_all()
+            if action == "allan.cancel":
+                if set(params) != {"operation_id"} or params["operation_id"] not in self.analysis_cancel:
+                    raise Fault("ANALYSIS_NOT_RUNNING", "指定分析操作未在排队或运行", 409)
+                self.analysis_cancel[params["operation_id"]].set()
             if len(self.operations) >= 10000:
                 raise Fault("OPERATION_LIMIT", "操作记录已达上限，请归档数据目录后再运行", 409)
             op = {"id": uuid.uuid4().hex, "key": key, "signature": signature, "action": action, "params": params, "state": "queued", "created_at": time.time()}
             self.operations[op["id"]] = op
             self.keys[key] = op["id"]
+            if action in {"firmware.cancel", "allan.cancel"}:
+                op.update(state="succeeded", result={"cancellation_requested": True, "operation_id": params["operation_id"]}, finished_at=time.time())
+                self._save_operations()
+                return copy.deepcopy(op)
+            if action == "allan.analyze":
+                self.analysis_cancel[op["id"]] = threading.Event()
+            if action == "firmware.upgrade":
+                self.firmware_reserved = op["id"]
+                self.firmware_status = None
+                self.firmware_cancel.clear()
             try:
-                self.jobs.put_nowait(op["id"])
+                target = self.analysis_jobs if action == "allan.analyze" else self.jobs
+                target.put_nowait(op["id"])
             except queue.Full:
+                self.analysis_cancel.pop(op["id"], None)
+                if action == "firmware.upgrade":
+                    self.firmware_reserved = None
                 del self.operations[op["id"]]
                 del self.keys[key]
                 raise Fault("QUEUE_FULL", "操作队列已满", 409) from None
@@ -295,18 +439,21 @@ class Service:
                 raise Fault("OPERATION_NOT_FOUND", "操作不存在", 404)
             return copy.deepcopy(self.operations[identifier])
 
-    def _worker(self):
+    def _worker(self, jobs=None):
+        jobs = self.jobs if jobs is None else jobs
         while not self.stop_event.is_set():
             try:
-                identifier = self.jobs.get(timeout=.2)
+                identifier = jobs.get(timeout=.2)
             except queue.Empty:
+                if jobs is self.jobs and not self.firmware_reserved and self.calibration_poll and self.source == "live":
+                    self._poll_calibration()
                 continue
             with self.lock:
                 op = self.operations[identifier]
                 op.update(state="running", started_at=time.time())
                 self._save_operations()
             try:
-                result = self._perform(op["action"], op["params"])
+                result = self._perform(op["action"], op["params"], operation_id=identifier)
                 state = "uncertain" if result.get("uncertain") else "succeeded"
                 with self.lock:
                     op.update(state=state, result=result)
@@ -320,10 +467,87 @@ class Service:
                 self.log(f"{op['action']} 内部错误：{exc}", "error")
             with self.lock:
                 op["finished_at"] = time.time()
+                if op["action"] == "allan.analyze":
+                    self.analysis_cancel.pop(identifier, None)
                 self._save_operations()
-            self.jobs.task_done()
+            jobs.task_done()
 
-    def _perform(self, action, p):
+    def _perform(self, action, p, operation_id=None):
+        if action.startswith("trajectory."):
+            with self.lock:
+                self._trajectory_watchdog()
+                if action in {"trajectory.reference", "trajectory.start"} and self.source == "playback" and self.playback and not self.playback["playing"]:
+                    raise Fault("PLAYBACK_PAUSED", "先开始回放，再建立参考或继续追踪", 409)
+                if action == "trajectory.options":
+                    self.trajectory.set_options(p)
+                else:
+                    if p: raise ValueError("此轨迹动作不接受参数")
+                    if action == "trajectory.reference":
+                        if self.source == "none" or self.source == "live" and not self.latest:
+                            raise Fault("NO_DATA", "建立参考需要有效数据源", 409)
+                        if self.firmware_reserved or self.device_restarting:
+                            raise Fault("DEVICE_BUSY", "设备升级或重启期间不能建立参考", 409)
+                        self.trajectory.begin_reference(); self.trajectory_epoch += 1
+                    elif action == "trajectory.start":
+                        if not self.trajectory.start():
+                            raise Fault("REFERENCE_REQUIRED", self.trajectory.message, 409)
+                    elif action == "trajectory.pause": self.trajectory.pause()
+                    elif action == "trajectory.reset":
+                        self.trajectory.reset(); self.trajectory_epoch += 1
+                return {"trajectory": self.trajectory.snapshot() | {"epoch": self.trajectory_epoch}, "verification": "host-inertial-estimate", "device_modified": False}
+        if action == "firmware.inspect":
+            if set(p) != {"id"}:
+                raise ValueError("固件检查需要 id")
+            return self.inspect_firmware(p["id"])
+        if action == "firmware.upgrade":
+            try:
+                return self._upgrade_firmware(p, operation_id)
+            finally:
+                with self.lock:
+                    self.firmware_reserved = None
+        if (self.firmware_reserved or self.device_restarting) and action not in {"allan.analyze", "allan.cancel", "record.export"}:
+            raise Fault("FIRMWARE_BUSY", "升级或重启占用设备", 409)
+        if action == "device.restart":
+            return self._restart_device(p, operation_id)
+        if action == "device.build-info":
+            if p:
+                raise ValueError("读取编译信息不接受参数")
+            info = v2.build_info(self._v2_request(v2.BUILD_INFO))
+            with self.lock:
+                self.device.update(build_info=info, updated_at=time.time())
+            return {"build_info": info, "verification": "device-ack"}
+        if action == "allan.analyze":
+            if set(p) != {"recording_id", "channel", "sample_rate"}:
+                raise ValueError("Allan 参数需要 recording_id、channel、sample_rate")
+            from .allan import analyze_recording
+            identifier = operation_id or uuid.uuid4().hex
+            with self.lock:
+                cancel = self.analysis_cancel.setdefault(identifier, threading.Event())
+            def progress(data):
+                with self.lock:
+                    if identifier in self.operations:
+                        self.operations[identifier]["progress"] = data
+            try:
+                if cancel.is_set():
+                    raise Fault("CANCELLED", "分析在执行前已取消", 409)
+                result = analyze_recording(self.recordings, p["recording_id"], p["channel"], p["sample_rate"], cancel=lambda: self.stop_event.is_set() or cancel.is_set(), progress=progress)
+                result["id"] = identifier
+                directory = self.settings.directory / "analyses"
+                directory.mkdir(exist_ok=True, mode=0o700)
+                atomic_json(directory / (identifier + ".json"), result)
+                return {"id": identifier, "sample_count": result["sample_count"], "verification": "original-recording-analysis"}
+            finally:
+                with self.lock:
+                    self.analysis_cancel.pop(identifier, None)
+        if action == "allan.cancel":
+            if set(p) != {"operation_id"}:
+                raise ValueError("取消分析需要 operation_id")
+            with self.lock:
+                event = self.analysis_cancel.get(p["operation_id"])
+                if not event:
+                    raise Fault("ANALYSIS_NOT_RUNNING", "分析尚未执行或已经结束", 409)
+                event.set()
+            return {"cancellation_requested": True, "operation_id": p["operation_id"]}
         if action == "connect":
             port = next((port for port in self.ports() if port["device"] == p.get("port")), None)
             if not port:
@@ -348,7 +572,7 @@ class Service:
                 if self.source not in {"live", "demo"} or not self.latest:
                     raise Fault("NO_DATA", "需要有效实时或演示数据才能录制")
                 self.record_error = None
-                return {"id": self.recordings.start(self.source, self.port, self.decoder.legacy_crc), "source": self.source}
+                return {"id": self.recordings.start(self.source, self.port, self.decoder.legacy_crc, device=copy.deepcopy(self.device)), "source": self.source}
         if action == "record.stop":
             with self.lock:
                 return {"id": self.recordings.stop()}
@@ -358,7 +582,7 @@ class Service:
                     raise Fault("RECORDING_ACTIVE", "先停止录制，再导出")
             return self.recordings.export(p["id"], self.stop_event)
         if action == "playback.open":
-            return self._open_playback(p["id"])
+            return self._open_playback(p["id"], operation_id=operation_id)
         if action == "playback.control":
             with self.lock:
                 if not self.playback:
@@ -381,7 +605,62 @@ class Service:
                 return {"position": self.playback["position"], "playing": self.playback["playing"], "speed": self.playback["speed"]}
         if action == "protocol.probe":
             return self._probe(p)
+        if action == "device.inspect":
+            if p:
+                raise ValueError("device.inspect does not accept parameters")
+            parsed = v2.versions(self._v2_request(v2.READ_VERSION))
+            with self.lock:
+                self.device["version"] = parsed
+                self.device["protocol"] = "v2" if parsed["app"][0] >= 2 else "legacy-v1"
+            if parsed["app"][0] < 2:
+                return {"version": parsed, "verification": "device-ack"}
+            config = v2.configuration(self._v2_request(v2.READ_CONFIGURATION))
+            static = v2.static_status(self._v2_request(v2.STATIC_STATUS))
+            six = v2.six_face_status(self._v2_request(v2.SIX_FACE_STATUS))
+            with self.lock:
+                self._apply_device_configuration(config)
+                self.device.update(static_calibration=static, six_face_calibration=six, updated_at=time.time())
+            return {"version": parsed, "configuration": config, "static_calibration": static, "six_face_calibration": six, "verification": "device-ack"}
+        if action == "device.calibration-status":
+            if p:
+                raise ValueError("device.calibration-status does not accept parameters")
+            result = {"static_calibration": v2.static_status(self._v2_request(v2.STATIC_STATUS)),
+                      "six_face_calibration": v2.six_face_status(self._v2_request(v2.SIX_FACE_STATUS))}
+            with self.lock:
+                self.device.update(result, updated_at=time.time())
+            return result | {"verification": "device-ack"}
         return self._device_action(action, p)
+
+    def _control_ack(self, ack):
+        with self.control_condition:
+            self.control_sequence += 1
+            self.control_replies.append((self.control_sequence, ack))
+            self.control_condition.notify_all()
+
+    def _v2_request(self, command, payload=b"", timeout=2):
+        # Operation worker is the only requester. The reader remains the sole
+        # consumer of the serial link; no direct reads or automatic retries.
+        with self.lock:
+            if self.source != "live" or not self.serial:
+                raise Fault("NOT_LIVE", "需要真实 USB 设备", 409)
+            link = self.serial
+            marker = self.control_sequence
+        self._write(v2.request(command, payload))
+        deadline = time.monotonic() + timeout
+        with self.control_condition:
+            while not self.stop_event.is_set():
+                if self.serial is not link:
+                    raise Fault("DEVICE_CHANGED", "查询期间设备连接已变化", 409)
+                reply = next((ack for sequence, ack in self.control_replies if sequence > marker and ack.command == command), None)
+                if reply is not None:
+                    if reply.code != 0:
+                        raise Fault("DEVICE_ACK_ERROR", f"设备拒绝命令 0x{command:02X}，ACK_CODE={reply.code}", 409)
+                    return reply.payload
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise Fault("DEVICE_ACK_TIMEOUT", f"未收到命令 0x{command:02X} 的有效应答；不会自动重发", 409)
+                self.control_condition.wait(min(.1, remaining))
+        raise Fault("CANCELLED", "服务正在关闭")
 
     def _probe(self, p):
         if p.get("acknowledged") is not True or set(p) != {"acknowledged"}:
@@ -433,44 +712,46 @@ class Service:
         self.log(f"协议探测 {identifier[:8]}：{len(chunks)} 个数据块，状态应答{'已观察到' if status else '未观察到'}")
         return {"id": identifier, "chunks": len(chunks), "frame_types": frame_types, "state_report_observed": status is not None, "firmware_version_verified": False, "configuration_write_supported": False, "capture_truncated": truncated, "uncertain": failure is not None, "message": failure or "探测记录已保存；查询完成不代表已识别新版控制协议"}
 
-    def _open_playback(self, identifier):
-        path = self.recordings.path(identifier)
-        if path.stat().st_size > 100 * 1024 * 1024:
-            raise Fault("REPLAY_TOO_LARGE", "首版回放限制为 100 MiB，较大录制仍可导出 CSV")
+    def _open_playback(self, identifier, operation_id=None):
         with self.lock:
             if self.recordings.writer:
                 raise Fault("RECORDING_ACTIVE", "先停止录制，再回放")
-        samples = []
-        for sample in self.recordings.samples(identifier):
-            if self.stop_event.is_set():
-                raise Fault("CANCELLED", "回放加载已取消")
-            if len(samples) >= 500000:
-                raise Fault("REPLAY_TOO_LARGE", "首版回放最多 50 万帧，较大录制仍可导出 CSV")
-            samples.append(sample)
-        if not samples:
-            raise Fault("EMPTY_RECORDING", "录制中没有有效帧")
+        last_progress = -1.
+        def progress(value):
+            nonlocal last_progress
+            now = time.monotonic()
+            if now - last_progress >= .5 or value["fraction"] >= 1:
+                last_progress = now
+                if operation_id:
+                    with self.lock:
+                        if operation_id in self.operations:
+                            self.operations[operation_id]["progress"] = value
+        stream = StreamingPlayback(self.recordings.path(identifier), cancel=self.stop_event, progress=progress)
         with self.lock:
+            # Validation/indexing does not change the current source. Only a
+            # successfully indexed recording is allowed to replace it.
+            if self.recordings.writer:
+                raise Fault("RECORDING_ACTIVE", "先停止录制，再回放")
             self._close_serial()
             self.auto_connect = False
             self.source, self.connection, self.error = "playback", "playback", None
-            self._clear_data()
-            self.playback = {"id": identifier, "samples": samples, "times": [s[0] for s in samples], "channels": {s[2].channel for s in samples}, "index": 0, "position": 0, "duration": samples[-1][0], "playing": False, "speed": 1, "last_tick": time.monotonic()}
-            self._seek(samples[0][0])
-        return {"id": identifier, "duration": self.playback["duration"], "samples": len(samples)}
+            self.playback = {"id": identifier, "stream": stream, "header": stream.header, "channels": stream.channels,
+                             "position": 0, "duration": stream.duration, "playing": False, "speed": 1,
+                             "last_tick": time.monotonic()}
+            self._seek(stream.first_elapsed)
+        return {"id": identifier, "duration": stream.duration, "samples": stream.sample_count,
+                "streaming": True, "checkpoints": len(stream.checkpoints)}
 
     def _seek(self, position):
         pb = self.playback
+        # Read first so corruption/file replacement leaves the current view
+        # intact rather than incrementing generation on a failed seek.
+        samples = pb["stream"].seek(position)
         self._clear_data()
-        end = bisect.bisect_right(pb["times"], position)
-        latest = {}
-        for index in range(end - 1, -1, -1):
-            frame = pb["samples"][index][2]
-            latest.setdefault(frame.channel, frame)
-            if len(latest) == len(pb["channels"]):
-                break
-        for frame in latest.values():
-            self._frame(frame, time.time())
-        pb["position"], pb["index"] = position, end
+        self.main_slave_id = pb["stream"].primary_slave_id
+        for elapsed, recorded_stamp, frame in samples:
+            self._frame(frame, time.time(), measurement_time=recorded_stamp)
+        pb["position"] = position
 
     def _tick_playback(self):
         with self.lock:
@@ -480,11 +761,19 @@ class Service:
             now = time.monotonic()
             pb["position"] = min(pb["duration"], pb["position"] + (now - pb["last_tick"]) * pb["speed"])
             pb["last_tick"] = now
-            while pb["index"] < len(pb["samples"]) and pb["samples"][pb["index"]][0] <= pb["position"]:
-                elapsed, stamp, frame = pb["samples"][pb["index"]]
-                self._frame(frame, time.time())
-                pb["index"] += 1
-            if pb["position"] >= pb["duration"]:
+            try:
+                samples, drained = pb["stream"].advance(pb["position"])
+            except ValueError as exc:
+                pb["playing"] = False
+                raise Fault("REPLAY_CHANGED", str(exc), 409) from None
+            batch = []
+            for elapsed, stamp, frame in samples:
+                item = self._frame(frame, time.time(), measurement_time=stamp)
+                if item is not None:
+                    batch.append(item)
+            if batch and hasattr(self, "_consume_trajectory"):
+                self._consume_trajectory(batch)
+            if pb["position"] >= pb["duration"] and drained:
                 pb["playing"] = False
 
     def _write(self, packet):
@@ -499,7 +788,106 @@ class Service:
                 raise Fault("SERIAL_WRITE_FAILED", "串口写入不完整，结果未知", 409)
             link.flush()
 
+    def _poll_calibration(self):
+        kind, deadline = self.calibration_poll
+        command, parse = (v2.STATIC_STATUS, v2.static_status) if kind == "gyro" else (v2.SIX_FACE_STATUS, v2.six_face_status)
+        try:
+            status = parse(self._v2_request(command, timeout=1))
+            with self.lock:
+                self.device["static_calibration" if kind == "gyro" else "six_face_calibration"] = status | {"updated_at": time.time()}
+            if status["state"] in (3, 4) or time.monotonic() > deadline:
+                self.calibration_poll = None
+                if status["state"] == 3:
+                    with self.lock:
+                        self._invalidate_reference()
+                self.log("校准状态：" + ("设备报告完成" if status["state"] == 3 else "设备报告失败" if status["state"] == 4 else "等待完成超时，结果未知"))
+        except (Fault, ValueError, OSError) as exc:
+            self.calibration_poll = None
+            self.log("校准状态查询停止，结果未知：" + str(exc), "warning")
+
+    def _v2_device_action(self, action, p):
+        if self.source != "live" or not self.serial:
+            raise Fault("NOT_LIVE", "需要真实 USB 设备", 409)
+        if self.recordings.writer:
+            raise Fault("RECORDING_ACTIVE", "先停止录制，再修改设备", 409)
+        if action == "device.read-settings":
+            if p:
+                raise ValueError("读取配置不接受参数")
+            result = v2.configuration(self._v2_request(v2.READ_CONFIGURATION))
+            with self.lock:
+                self._apply_device_configuration(result)
+            return {"configuration": result, "verification": "device-ack"}
+        if self.calibration_poll and action not in {"device.calibration-abort"}:
+            raise Fault("CALIBRATION_ACTIVE", "校准正在进行，请等待完成或取消六面校准", 409)
+        if action == "device.configure":
+            current = self.device.get("configuration", {})
+            commands = v2.configuration_commands(p, current)
+            entered = False
+            outcome = None
+            try:
+                entered = True
+                self._v2_request(2, b"\x01")
+                for command, payload in commands:
+                    self._v2_request(command, payload)
+                actual = v2.configuration(self._v2_request(v2.READ_CONFIGURATION))
+                with self.lock:
+                    if {"installation_rotation", "accel_range", "gyro_range"} & p.keys():
+                        self._invalidate_reference()
+                if any(actual.get(k) != value for k, value in p.items()):
+                    outcome = {"uncertain": True, "configuration": actual, "message": "当前参数回读不匹配；没有发送保存指令"}
+                else:
+                    self._v2_request(0x0C)
+                    with self.lock:
+                        self.device.update(configuration=actual, updated_at=time.time())
+                    outcome = {"configuration": actual, "verification": "device-ack-and-readback", "save_acknowledged": True,
+                               "persistent_storage_verified": False, "recalibration_required": bool({"installation_rotation", "accel_range", "gyro_range"} & p.keys())}
+            except (Fault, OSError, ValueError) as exc:
+                with self.lock:
+                    if {"installation_rotation", "accel_range", "gyro_range"} & p.keys():
+                        self._invalidate_reference()
+                outcome = {"uncertain": True, "message": str(exc) + "；参数操作结果未知，不会自动重发"}
+            finally:
+                if entered:
+                    try:
+                        self._v2_request(2, b"\x00")
+                    except (Fault, OSError) as exc:
+                        outcome = (outcome or {}) | {"uncertain": True, "exit_acknowledged": False, "message": "退出设置模式未确认：" + str(exc)}
+                        self.log("退出设置模式未确认：" + str(exc), "warning")
+            return outcome
+        if action in {"device.calibrate", "device.yaw-zero", "device.factory-reset", "device.calibration-abort"}:
+            if p.get("acknowledged") is not True:
+                raise Fault("ACKNOWLEDGEMENT_REQUIRED", "请显式提供 acknowledged=true 确认设备操作")
+            if action == "device.calibrate":
+                if set(p) != {"kind", "acknowledged"} or p["kind"] not in {"gyro", "six-face"}:
+                    raise ValueError("校准类型为 gyro 或 six-face")
+                command, payload = (v2.STATIC_START, b"") if p["kind"] == "gyro" else (v2.SIX_FACE_CONTROL, b"\x00")
+            else:
+                if set(p) != {"acknowledged"}:
+                    raise ValueError("包含未知设备操作参数")
+                command, payload = {"device.yaw-zero": (0x17, b""), "device.factory-reset": (0x0D, b""), "device.calibration-abort": (v2.SIX_FACE_CONTROL, b"\x01")}[action]
+            if action in {"device.yaw-zero", "device.factory-reset"}:
+                with self.lock:
+                    self._invalidate_reference()
+            try:
+                self._v2_request(command, payload)
+            except (Fault, OSError) as exc:
+                return {"uncertain": True, "message": str(exc) + "；设备操作结果未知，不会自动重发"}
+            if action == "device.calibrate":
+                self.calibration_poll = (p["kind"], time.monotonic() + (30 if p["kind"] == "gyro" else 600))
+                return {"kind": p["kind"], "started": True, "completed": False, "verification": "device-start-ack", "message": "设备已接受校准；进度与结果以设备后续状态应答为准"}
+            if action == "device.calibration-abort":
+                self.calibration_poll = None
+            if action == "device.factory-reset":
+                with self.lock:
+                    self.device.pop("configuration", None)
+            return {"verification": "device-ack", "message": "设备已确认指令"}
+        if action == "device.angle-zero":
+            raise Fault("UNSUPPORTED_PROTOCOL", "新版固件支持航向归零，请使用 device.yaw-zero", 409)
+        raise Fault("UNKNOWN_ACTION", "未知设备操作")
+
     def _device_action(self, action, p):
+        if self.settings.values["protocol"] != "legacy-v1" and self.device.get("protocol") == "v2":
+            return self._v2_device_action(action, p)
         if action == "device.yaw-zero":
             raise Fault("UNSUPPORTED_PROTOCOL", "航向单独归零需要新版协议；旧版只公开了角度置零", 409)
         if self.settings.values["protocol"] != "legacy-v1":

@@ -1,14 +1,10 @@
 # DM IMU Workbench · 达妙惯性测量工作台
 
-独立的 **DM-IMU-L1 USB 上位机**，提供浏览器工作台和 Agent CLI。采用类似 IterxAI Host App 的 Python 启动方式、侧栏工作区、明暗主题和卡片样式，默认端口 **5050**。
+独立的 **DM-IMU-L1 USB 上位机**，提供浏览器工作台和 Agent 接口。Python 启动方式、侧栏和卡片布局参考 IterxAI Host App，默认端口 **5050**。支持新版模块配置/校准协议、波形与频谱、Allan 偏差、录制回放及三维轨迹估计。
 
-![实时监测工作台（明确标记的演示数据）](docs/images/monitor.png)
+## 启动
 
-## 快速开始
-
-需要 Python **3.11 或更新版本**。首次安装依赖需要网络；三维和图表资源已随项目提供，运行时不依赖 CDN、Node.js、ROS 或官方 Windows 上位机。
-
-### Linux
+需要 Python **3.11+**。浏览器三维和图表资源随仓库提供，无需 Node.js、ROS、CDN 或官方 Windows 上位机；Node 只用于开发检查。
 
 ```bash
 git clone git@github.com:HFO4AR/dmimu_host_app.git
@@ -16,131 +12,117 @@ cd dmimu_host_app
 ./start.sh
 ```
 
-启动脚本创建 `.venv` 并安装依赖。打开 **http://127.0.0.1:5050**，用支持数据传输的 Type-C 线连接 IMU。
+Windows 安装 Python Launcher 后双击 `start.bat`。打开 **http://127.0.0.1:5050**，用 Type-C 数据线连接模块。后端独占串口，浏览器不需要 Web Serial 权限。
 
-手动启动方式：
+首次启动自动创建 `.venv`、安装依赖、下载并转换官方 STEP 模型。后续启动验证模型缓存，不重复下载或创建转换环境。CAD 准备失败会显示原因，采集和分析服务仍启动；三维窗口提示模型尚未准备。首次 CAD 转换的 OpenCascade/VTK 依赖较大，且需要当前平台有对应 Python wheel。
+
+跳过模型准备或指定缓存：
+
+```bash
+DMIMU_SKIP_MODEL=1 ./start.sh
+DMIMU_MODEL_CACHE=/path/to/model-cache ./start.sh
+.venv/bin/python scripts/prepare_model.py --install  # 稍后单独准备
+```
+
+PowerShell 中使用 `$env:DMIMU_SKIP_MODEL='1'` 或 `$env:DMIMU_MODEL_CACHE='C:\path\models'` 后运行 `./start.bat`。官方 CAD、Windows EXE 和固件不随源码再分发。模型来源及坐标依据见 [模型说明](docs/MODEL.md)。
+
+手动启动：
 
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-python app.py
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python scripts/prepare_model.py --install  # 可选
+.venv/bin/python app.py --port 5050
 ```
 
-### Windows
+Windows 对应使用 `.venv\Scripts\python.exe`。
 
-安装 Python 3.11+（启用 Python Launcher），克隆或下载项目，双击 `start.bat`。也可在 PowerShell 中运行：
+### Type-C 自动接入
 
-```powershell
-py -3 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe app.py
-```
+服务每两秒扫描已识别的 DM-IMU USB 设备，唯一候选时自动连接，多个候选时手动选择；成功连接后按 USB 身份优先重连。手动断开、演示或回放会暂停自动连接。使用“连接”或上位机设置恢复。
 
-访问同一个 **http://127.0.0.1:5050**。USB 设备由 Python 后端打开，浏览器不需要 Web Serial 权限。
+已识别描述为 `DM-IMU-L1`、VID/PID `6877:4D55` 的模块。通用 CDC/STM32 描述需要首次手动选串口；程序不会自动打开所有通用串口。默认波特率 921600。
 
-### Type-C 接入
+连接后先被动接收，不自动配置、归零、校准或升级。端口打开与有效数据接收分别显示，通道超过两秒未更新标为过期。设备控制先点击“读取版本与配置”，确认协议与能力；未知版本不套用旧指令。
 
-服务每两秒扫描已识别的 DM-IMU USB 设备。只有唯一候选设备时自动连接；多个候选时手动选择。成功连接过的设备按 USB 身份优先重连。手动断开、演示和回放会暂停本次自动连接；需要恢复时点击“连接”或在上位机设置启用自动连接。
+## 功能
 
-实机已确认 DM-IMU-L1 描述能被自动识别，USB VID/PID 为 `6877:4D55`。若其他版本只显示通用 CDC / STM32 串口，首次需要在连接栏选择它并点击“连接”；之后记住其 USB 身份。程序不把所有通用串口都当作 IMU 自动打开。
-
-默认波特率为 921600。打开串口后先接收数据，**不自动保存参数、归零或校准**。没有有效数据时显示具体状态；各通道超过两秒未更新会标注过期。端口打开成功与有效数据接收成功分别显示。
-
-## 工作区
-
-| 工作区 | 功能 |
+| 工作区 | 已实现的功能 |
 | --- | --- |
-| 实时监测 | 三维姿态、坐标轴、欧拉角、四元数、加速度、角速度、温度与接收频率 |
-| 波形分析 | 三类实时曲线、通道图例开关、时间窗口、暂停和拖动缩放；降采样保留极值 |
-| 录制与回放 | 原始 USB 数据、接收时间、回放拖动和倍速、CSV 与原始记录下载 |
-| 设备参数 | 经确认的旧版 1.x 控制指令、温控、参数回读及校准指令 |
-| 诊断日志 | 协议错误、操作结果和有界协议探测 |
-| 上位机设置 | 主题、强调色、自动连接、波特率、局域网与 Agent 接入 |
+| 实时监测 | 官方 STEP 壳体/接口/安装孔网格，实物标记对应 XYZ、四元数优先、Euler ZYX、显示归零、三轴/温度/接收频率 |
+| 波形分析 | 四类通道同步时间轴，通道开关，框选缩放、平移、暂停、数值范围、双游标与差值、Y 轴锁定、极值保留、PNG |
+| 数据导出 | 当前波形窗口原始点导出 CSV、Excel `.xlsx`、MATLAB Level 5 `.mat`；保留来源、时基、通道与原始单位 |
+| 实时 FFT | Web Worker，256–16384 点，Hann/Hamming/矩形窗、去均值、窗增益校正、单边幅值、主峰与频谱 CSV/XLSX/MAT |
+| Allan 偏差 | 已完成录制的重叠 Allan 偏差、进度/取消、双对数图、噪声系数与拟合区间、JSON/CSV/PNG |
+| 三维轨迹 | Service 常驻估计与 Agent 控制、显式静止参考、世界重力补偿、可选静止零速、分段/缺口停止、有界点集、CSV/XLSX/MAT |
+| 录制与回放 | 原始 USB 数据及接收时间，回放定位/倍速，CSV、原始 `.dmimulog` 下载，官方 `.imulog` 双向容器转换；分析使用录制时基 |
+| 设备参数与校准 | V2 版本、配置与校准状态读取，输出/周期/温控/CAN/RS485 参数、安装方向/量程、静止与六面校准/取消、航向归零和出厂恢复 |
+| 固件升级 | 官方包元数据/版本检查、分页和 ACK 状态机、升级进度、取消、重连后版本核验；详细边界见升级说明 |
+| 诊断与设置 | 协议校验、操作结果与日志、中/英文、浅/深色、蓝青绿橙紫红六色、10/20/30/60Hz波形重绘、自动连接、局域网密码和 Agent 接入 |
 
-“显示归零”只改变三维画面的参考姿态；设备角度归零是独立设备操作。界面角速度可选 °/s 或 rad/s，记录及 CSV 保留设备原始 rad/s。
+“体验演示”需要显式点击；live / demo / playback 始终分别标记，不会在无设备时伪造实测。“显示归零”仅改变画面，设备航向归零是独立操作。图表的 °/s 显示不会改变原始 rad/s 记录与导出。
 
-“体验演示”必须显式点击；演示、真实 USB 和回放始终显示不同来源。无设备时不会自动伪造数据。
+FFT 与 Allan 使用用户填写或设备回读的标称输出频率，USB 接收频率不是设备采样时钟。FFT 是单边幅值频谱，不是功率谱密度。Allan 系数是静止噪声模型估计，不满足拟合条件会显示“未识别”。详见 [波形导出](docs/WAVEFORMS.md) 和 [Allan 分析](docs/ALLAN.md)。
 
-## 固件兼容范围
+**轨迹是六轴惯性积分估算，不能提供绝对位置或长期高精度定位。** 先静止建立参考，初始速度假设为零；误差会经两次积分累积。静止零速可能把匀速平移误判为静止，可手动关闭。最长 120 秒/12000 点；缺口停止，来源变化或重新建立参考清空旧轨迹。Service 是唯一持续估计来源，网页和 Agent 共用状态；关闭网页不停止已启动的追踪。Agent 通过 trajectory.reference/start/pause/reset/options 控制，并可直接下载当前轨迹。见 [轨迹说明](docs/TRAJECTORY.md)。
 
-协议参考为达妙官方 [DM-IMU 仓库](https://gitee.com/kit-miao/dm-imu)，固定核对提交 `ba758fd6106c2b210713bf1ef05800f1688f73c5`；旧控制指令来自历史 V1.2 手册和官方 ROS1 例程。详细证据和格式见 [协议说明](docs/PROTOCOL.md)。
+## 协议与实机验证边界
 
-| 能力 | 当前状态 |
-| --- | --- |
-| USB 测量帧 | 实机验证三轴和四元数约 1 kHz、CRC 无错；设备固件版本未知，温度与状态帧尚待实机验证 |
-| 1.x 输出通道、周期、温控与保存 | 已实现公开指令；需先确认固件为 1.x 并在设置选择旧版协议 |
-| 1.x 当前参数回读 | 收到新鲜状态帧并匹配参数后才报告回读成功；不宣称断电保存已验证 |
-| 1.x 校准和角度置零 | 可显式发送公开指令；缺少完成回报时标为 `uncertain`，不报告校准完成 |
-| 2.x 参数、安装方向、量程、航向归零及校准 | **尚未支持**：官方最新手册不提供控制协议，新版上位机与固件仅发布二进制 |
-| 固件烧录、CAN、RS485 | 不在首版范围 |
+来源为 [达妙官方仓库](https://gitee.com/kit-miao/dm-imu)，固定提交 `ba758fd6106c2b210713bf1ef05800f1688f73c5`。新版控制协议从官方 2026-09-24 NativeAOT 上位机的封包、解析器与状态机独立还原；不是仅凭字符串猜命令。见 [协议说明](docs/PROTOCOL.md)、[V2 格式](docs/V2_PROTOCOL.md) 和 [固件协议](docs/FIRMWARE.md)。
 
-自动接收模式不发送旧版控制指令。不要在未确认版本的 2.x 模块上启用 `legacy-v1`。这份首版不宣称已实现 2.x 的完整设备控制。
+V2 配置写入需要版本识别、ACK 与配置回读；保存 ACK 不证明断电持久保存。校准启动 ACK 只证明已接受开始，完成/失败以设备后续状态为准。升级进度 100% 只证明分页阶段，必须重连读回目标版本才报告成功。官方包格式校验与 SHA-256 标识不等于厂商数字签名认证。
 
-### 协议探测
+新版版本、22字节参数和校准状态已通过真实串口只读核对，具体原始应答与实测保留本机。公开软件测试覆盖协议封包/解析、fake serial 事务、分析数学和浏览器行为。**本轮未对真实设备执行物理校准、出厂恢复或固件擦写，也未用外部位置真值验收轨迹精度。** Windows 脚本和 ACL 逻辑须结合实际 Windows/COM 设备验收；跨平台 CI 不能替代实机证据。详细记录由 [验证说明](docs/VALIDATION.md) 区分软件、浏览器与设备证据。
 
-“诊断日志 → 协议探测”只对真实 USB 设备开放。确认后最多三次发送 V1.2 已公开的设置状态查询并退出设置模式，保存原始请求、应答和校验结果。不会扫描全部命令 ID、修改参数或保存配置。发现状态应答也不等于识别了新固件控制协议。
+旧版 1.x 公开指令保留在 `legacy-v1` 模式；只有确认设备版本后才手动启用。旧版缺少可验证的校准完成回报时返回 `uncertain`，不冒充完成。
 
-## Agent 控制
+## Agent
 
-服务运行后，同用户 Agent 可用系统 Python 零配置访问。CLI 只依赖标准库，不直接打开串口。
+服务启动后，同用户 Agent 可使用标准库 CLI 自动发现私有凭据，不直接占用串口：
 
 ```bash
-python3 agent_cli.py capabilities
-python3 agent_cli.py status
-python3 agent_cli.py ports
-python3 agent_cli.py action connect --params '{"port":"/dev/ttyACM0"}' --idempotency-key connect-001
-python3 agent_cli.py action record.start --idempotency-key record-001
-python3 agent_cli.py action record.stop --idempotency-key stop-001
-python3 agent_cli.py recordings
+python3 -S agent_cli.py capabilities
+python3 -S agent_cli.py status
+python3 -S agent_cli.py ports
+python3 -S agent_cli.py action device.inspect --idempotency-key inspect-001
+python3 -S agent_cli.py action record.start --idempotency-key record-001
+python3 -S agent_cli.py action record.stop --idempotency-key stop-001
+python3 -S agent_cli.py recordings
 ```
 
-Windows 使用 `py -3 agent_cli.py`，端口使用实际 `COM` 编号；复杂 JSON 建议使用 `--params-file`。CLI stdout 是单个 JSON 文档，成功退出码为 0，失败或写操作结果未知为 2。
+Windows 使用 `py -3`，复杂 JSON 使用 `--params-file`。设备写操作与校准需按已有用户授权显式调用，幂等键用于恢复未知结果；`uncertain`/超时后查询原操作，不换键重复执行。
 
-详见 [Agent 使用指南](docs/AGENT_GUIDE.md) 与 [API 接口](docs/API.md)。
+所有 HTTP 功能共用 `/api/v1` 浏览器前缀和 `/api/agent/v1` Agent 前缀。波形/轨迹导出返回二进制附件；CLI `action` 控制队列操作，具体路径与 payload 见 [API](docs/API.md) 和 [Agent 指南](docs/AGENT_GUIDE.md)。
 
-## 本机数据与局域网
+## 本机数据与网络
 
-默认运行目录：
+默认数据目录：Linux `${XDG_STATE_HOME:-~/.local/state}/dmimu-workbench`；Windows `%LOCALAPPDATA%\DM-IMU-Workbench`。保存设置、Token、操作、录制、分析、升级和探测资料。Linux 私有权限、Windows 当前用户 ACL；不进 Git。自定义 `--data-dir` 必须使用支持私有权限的本机目录，CLI 也用同目录；一个目录只运行一个实例。
 
-- Linux：`${XDG_STATE_HOME:-~/.local/state}/dmimu-workbench`
-- Windows：`%LOCALAPPDATA%\DM-IMU-Workbench`
+默认监听本机 5050，本机浏览器免登录。在上位机设置创建密码并启用局域网，重启后监听 `0.0.0.0:5050`，其他浏览器需要登录。服务器接入设置只允许本机网页修改。
 
-目录保存设置、私有凭据、操作记录、录制和探测结果。Linux 设置与凭据限制为本人可读写，Windows 使用当前用户 ACL；这些文件不进入 Git。记录 `.dmimulog` 是版本化 JSONL，含原始数据块和主机时间。
-
-可用 `--data-dir` 指定另一个**支持私有权限的本机目录**；CLI 必须使用相同目录。Linux 下不要把私有数据放到会忽略 chmod 的 FAT/exFAT 等共享挂载盘。一个运行目录只允许一个实例。
-
-默认本机浏览器免登录。通过“上位机设置 → 安全与局域网”创建密码并启用局域网，重启后监听 `0.0.0.0:5050`，其他电脑需登录。服务器接入与控制协议设置只允许本机网页修改。
-
-远程 Agent 必须通过 HTTPS 反向代理，显式指定地址和私有 Token 文件。CLI 不接受远程明文 HTTP。配置可信代理时使用 `--trusted-proxy 127.0.0.1`，代理需传递 `X-Forwarded-For`、`X-Forwarded-Proto` 和 `X-Forwarded-Host`；不要将未知代理设为可信。
+远程 Agent 需要 HTTPS 反向代理和显式私有 Token 文件。CLI 不接受远程明文 HTTP，不跳过证书校验。可信代理通过 `--trusted-proxy` 指定，未知代理不应加入。官方下载、照片、私有凭据、实测原始数据与本机固件均不发布。
 
 ```bash
 python app.py --port 5050
-python app.py --demo                  # 明确以演示数据启动
-python app.py --no-auto-connect       # 启动但暂不扫描设备
-python app.py --dev                   # 本机开发服务，无自动重载
+python app.py --demo
+python app.py --no-auto-connect
+python app.py --dev  # 不自动重载，不创建第二个串口实例
 ```
 
-## 常见问题
+## 排查与开发
 
-- **没有 USB 串口**：确认使用数据线，检查 Linux `ls /dev/serial/by-id/` 或 Windows 设备管理器。Linux 不显示未接设备的主板 `ttyS` 串口。
-- **Permission denied**：查看设备节点的组和当前用户权限。Fedora 常见为 `dialout`，将当前用户加入实际设备所属组后重新登录；不要用 root 运行整个工作台。
-- **打开但没有数据**：检查模块输出是否选择 USB、所需通道是否启用；2.x 设置需要支持该固件的官方工具，不能靠旧指令猜配置。
-- **CRC 错误增长**：检查线缆和供电；只有确实使用旧 CRC 变体时才启用兼容选项。
-- **端口占用**：关闭其他持有 IMU 的上位机。5050 被占用时本程序会报错，不停止其他服务；可用 `--port` 改端口。
-- **Agent 找不到 Token**：先启动服务，核对是否同一用户及数据目录。使用 `--host-url` 时必须同时提供 `--token-file`。
-- **回放限制**：首版单次加载最多 100 MiB / 50 万帧；更大的录制仍可流式导出 CSV。拔出设备会结束录制，重连后需重新开始。
+没有 USB 串口时先确认数据线，检查 Linux `/dev/serial/by-id/` 或 Windows 设备管理器；Linux 权限错误按实际设备所属组配置，避免 root 运行整个工作台。设备被其他上位机占用时先关闭对应程序。5050 被占用会报错，不会停止别人的服务。
 
-## 开发与验证
+官方 `.imulog` 和本项目 `.dmimulog` 支持导入（最多1GiB）；容器读写已对照官方程序并做合成roundtrip，尚未实际在Windows官方EXE中打开导出文件。见 [录制格式](docs/RECORDINGS.md)。
+
+回放使用流式解码与稀疏检查点，导入最多 1 GiB；不把整份记录或全部测量帧加载到内存。定位后沿用录制时基。拔出会结束录制，重新连接后需重新开始。`Agent Token` 找不到时核对同用户、服务是否运行和数据目录。
 
 ```bash
-python -m unittest discover -s tests -v
-python -S agent_cli.py --help
-node --check static/app.js
-node --check static/charts.js
-node --check static/pose.js
+.venv/bin/python -m unittest discover -s tests -v
+python3 -S agent_cli.py --help
+node tests/pose_math.mjs
+node tests/fft_math.mjs
+node tests/trajectory_math.mjs
 ```
 
-GitHub Actions 配置 Linux / Windows、Python 3.11 / 3.14 的测试矩阵。当前本机验证结果见 [验证记录](docs/VALIDATION.md)，模拟、浏览器和实机证据分别记录。
-
-后端按协议、串口服务、存储录制和 Web 接口拆分；前端按工作台、三维姿态和曲线拆分。第三方前端资源与许可证保存在 `static/vendor/`。
+GitHub Actions 使用 Ubuntu/Windows × Python 3.11/3.14，安装 NumPy 与 Excel 导出依赖并运行后端测试、前端语法和数学验证。软件源码与第三方前端许可证可公开；官方 CAD/EXE/固件缓存、用户照片与真实测量不包含在发布内容中。

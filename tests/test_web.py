@@ -26,6 +26,15 @@ class WebTests(unittest.TestCase):
         headers = {"Authorization": "Bearer " + self.settings.values["agent_token"]}
         self.assertTrue(self.client.get("/api/agent/v1/status", headers=headers).json["ok"])
 
+    def test_shared_trajectory_requires_auth_and_valid_indices(self):
+        self.assertEqual(self.client.get("/api/agent/v1/trajectory").status_code, 401)
+        headers = {"Authorization": "Bearer " + self.settings.values["agent_token"]}
+        data = self.client.get("/api/agent/v1/trajectory?after=0&epoch=0", headers=headers).json["data"]
+        self.assertEqual(data["points"], [])
+        self.assertIn("status", data)
+        for query in ("after=-1", "after=12001", "epoch=abc"):
+            self.assertEqual(self.client.get("/api/agent/v1/trajectory?" + query, headers=headers).status_code, 400)
+
     def test_browser_mutation_requires_csrf(self):
         data = {"action": "demo"}
         self.assertEqual(self.client.post("/api/v1/actions", json=data).status_code, 403)

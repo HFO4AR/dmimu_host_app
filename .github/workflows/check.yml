@@ -27,3 +27,18 @@ jobs:
       - run: node --check static/app.js
       - run: node --check static/charts.js
       - run: node --check static/pose.js
+      - run: node --check static/trajectory.js
+      - run: node --check static/trajectory_math.js
+      - run: node --check static/fft.js
+      - run: node --check static/fft_math.js
+      - run: node --check static/allan.js
+      - run: node --check static/firmware.js
+      - run: node --check static/device.js
+      - run: node tests/pose_math.mjs
+      - run: node tests/fft_math.mjs
+      - run: node tests/trajectory_math.mjs
+      - run: node --check static/preferences.js
+      - run: node --check static/locale.js
+      - run: node --check static/fft_worker.js
+      - run: node --check static/theme.js
+      - run: node --check static/rotations.js

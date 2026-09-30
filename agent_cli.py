@@ -1,5 +1,6 @@
 """Standard-library-only agent client; stdout is exactly one JSON document."""
 import argparse
+from http.client import HTTPException
 import ipaddress
 import json
 import os
@@ -54,11 +55,26 @@ def main():
     action.add_argument("--no-wait", action="store_true")
     download = sub.add_parser("download")
     download.add_argument("id")
-    download.add_argument("--format", choices=("raw", "csv"), default="raw")
+    download.add_argument("--format", choices=("raw", "csv", "imulog"), default="raw")
     download.add_argument("--output", type=Path, required=True)
     probe = sub.add_parser("probe-download")
     probe.add_argument("id")
     probe.add_argument("--output", type=Path, required=True)
+    analysis = sub.add_parser("analysis-download")
+    analysis.add_argument("id")
+    analysis.add_argument("--format", choices=("json", "csv"), default="json")
+    analysis.add_argument("--output", type=Path, required=True)
+    trajectory = sub.add_parser("trajectory-download")
+    trajectory.add_argument("--format", choices=("mat", "xlsx", "csv"), required=True)
+    trajectory.add_argument("--output", type=Path, required=True)
+    for cmd in ("waveform-export", "spectrum-export", "trajectory-export"):
+        exp = sub.add_parser(cmd)
+        exp.add_argument("--input", type=Path, required=True, help="原始数组与元数据 JSON 文件")
+        exp.add_argument("--format", choices=("mat", "xlsx", "csv"), required=True)
+        exp.add_argument("--output", type=Path, required=True)
+    for cmd in ("recording-import", "firmware-upload"):
+        upload = sub.add_parser(cmd)
+        upload.add_argument("--input", type=Path, required=True)
     args = p.parse_args()
     output = None
     exit_code = 0
@@ -111,12 +127,37 @@ def main():
                 output["error"] = output["operation"].get("error", {"code": "RESULT_UNCERTAIN", "message": "设备结果未知，请查询原操作，不要换键重试"})
         elif args.command == "operation":
             output = call("/operations/" + args.id)
-        elif args.command in {"download", "probe-download"}:
+        elif args.command in {"recording-import", "firmware-upload"}:
+            maximum = 1024 * 1024 * 1024 if args.command == "recording-import" else 4096 * 255 + 18
+            if not args.input.is_file() or not 0 < args.input.stat().st_size <= maximum:
+                raise ValueError("输入文件不存在、为空或超过上传限制")
+            path = "/recordings/import" if args.command == "recording-import" else "/firmware/upload"
+            with args.input.open("rb") as source:
+                req = Request(prefix + path, data=source, headers={"Authorization": "Bearer " + token, "Content-Type": "application/octet-stream", "Content-Length": str(args.input.stat().st_size)})
+                with urlopen(req, timeout=args.timeout) as response:
+                    output = json.load(response)
+        elif args.command in {"download", "probe-download", "analysis-download", "trajectory-download", "waveform-export", "spectrum-export", "trajectory-export"}:
             import re
-            if not re.fullmatch(r"[0-9a-f]{32}", args.id):
-                raise ValueError("无效制品 ID")
-            path = f"/recordings/{args.id}/{args.format}" if args.command == "download" else f"/protocol-probes/{args.id}"
-            req = Request(prefix + path, headers={"Authorization": "Bearer " + token})
+            headers = {"Authorization": "Bearer " + token}
+            body = None
+            if args.command.endswith("-export"):
+                if args.input.stat().st_size > 48 * 1024 * 1024:
+                    raise ValueError("导出数据文件超过 48 MiB")
+                data = json.loads(args.input.read_text(encoding="utf-8"))
+                if not isinstance(data, dict): raise ValueError("输入 JSON 必须为对象")
+                data["format"] = args.format
+                path = {"waveform-export": "/waveforms/export", "spectrum-export": "/spectra/export", "trajectory-export": "/trajectories/export"}[args.command]
+                body = json.dumps(data, allow_nan=False).encode()
+                headers["Content-Type"] = "application/json"
+            elif args.command == "trajectory-download":
+                path = "/trajectory/" + args.format
+            else:
+                if not re.fullmatch(r"[0-9a-f]{32}", args.id):
+                    raise ValueError("无效制品 ID")
+                if args.command == "download": path = f"/recordings/{args.id}/{args.format}"
+                elif args.command == "analysis-download": path = f"/analyses/{args.id}/{args.format}"
+                else: path = f"/protocol-probes/{args.id}"
+            req = Request(prefix + path, data=body, headers=headers)
             temporary = args.output.with_name(args.output.name + ".part")
             if args.output.exists() or temporary.exists():
                 raise ValueError("输出文件已存在，使用新的路径")
@@ -141,7 +182,7 @@ def main():
         if "idempotency_key" in previous:
             output["idempotency_key"] = previous["idempotency_key"]
         exit_code = 2
-    except (OSError, URLError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError) as exc:
+    except (OSError, URLError, HTTPException, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError) as exc:
         output = (output or {}) | {"ok": False, "error": {"code": "TOKEN_UNAVAILABLE" if isinstance(exc, FileNotFoundError) and args.command != "download" else "CLIENT_ERROR", "message": str(exc)}}
         exit_code = 2
     print(json.dumps(output, ensure_ascii=False, allow_nan=False))

@@ -12,12 +12,23 @@ CHANNELS = {1: "acceleration", 2: "angular_velocity", 3: "euler", 4: "quaternion
 UNITS = {"acceleration": "m/s²", "angular_velocity": "rad/s", "euler": "deg", "quaternion": "wxyz", "temperature": "°C"}
 
 
+def _crc_table():
+    result = []
+    for byte in range(256):
+        value = byte << 8
+        for _ in range(8):
+            value = ((value << 1) ^ (0x1021 if value & 0x8000 else 0)) & 0xFFFF
+        result.append(value)
+    return tuple(result)
+
+
+CRC_TABLE = _crc_table()
+
+
 def crc16(data: bytes) -> int:
     value = 0xFFFF
     for byte in data:
-        value ^= byte << 8
-        for _ in range(8):
-            value = ((value << 1) ^ (0x1021 if value & 0x8000 else 0)) & 0xFFFF
+        value = ((value << 8) ^ CRC_TABLE[((value >> 8) ^ byte) & 255]) & 0xFFFF
     return value
 
 
@@ -34,16 +45,21 @@ class Frame:
 
 
 class Decoder:
-    def __init__(self, legacy_crc=False):
+    def __init__(self, legacy_crc=False, control_callback=None):
         self.buffer = bytearray()
         self.legacy_crc = legacy_crc
+        self.control_callback = control_callback
+        self.control_frames = 0
         self.frames = self.crc_errors = self.discarded_bytes = 0
 
     def feed(self, chunk: bytes) -> list[Frame]:
         self.buffer.extend(chunk)
         result = []
         while len(self.buffer) >= 4:
-            pos = self.buffer.find(b"\x55\xaa")
+            measurement = self.buffer.find(b"\x55\xaa")
+            control = self.buffer.find(b"\xa5")
+            positions = [p for p in (measurement, control) if p >= 0]
+            pos = min(positions) if positions else -1
             if pos < 0:
                 keep = 1 if self.buffer[-1] == 0x55 else 0
                 self.discarded_bytes += len(self.buffer) - keep
@@ -52,6 +68,28 @@ class Decoder:
             if pos:
                 self.discarded_bytes += pos
                 del self.buffer[:pos]
+            if self.buffer[0] == 0xA5:
+                if len(self.buffer) < 5:
+                    break
+                length = int.from_bytes(self.buffer[3:5], "little")
+                if length > 32:
+                    self.discarded_bytes += 1
+                    del self.buffer[0]
+                    continue
+                if len(self.buffer) < length + 8:
+                    break
+                from .v2 import parse_ack
+                ack = parse_ack(bytes(self.buffer[:length + 8]))
+                if ack is None:
+                    self.crc_errors += 1
+                    self.discarded_bytes += 1
+                    del self.buffer[0]
+                    continue
+                del self.buffer[:length + 8]
+                self.control_frames += 1
+                if self.control_callback:
+                    self.control_callback(ack)
+                continue
             kind = self.buffer[3]
             lengths = {1: (19,), 2: (19,), 3: (19,), 4: (23,), 5: (19, 23), 7: (19,)}.get(kind)
             if lengths is None:
