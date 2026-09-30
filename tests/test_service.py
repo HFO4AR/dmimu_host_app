@@ -61,6 +61,19 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.service.serial.writes, [])
         self.assertEqual(self.service.connection, "connected")
 
+    def test_receiver_does_not_erase_uncertain_device_operation(self):
+        self.service._perform("connect", {"port": "/fake/imu"})
+        self.service.connected_at = time.time() - 10
+        self.service.connection = "restart-uncertain"
+        self.service.error = "版本尚未核实"
+        self.service.start()
+        time.sleep(.08)
+        self.assertEqual(self.service.connection, "restart-uncertain")
+        self.service._ingest(encode_frame(1, [0, 0, 9.80665]), time.time())
+        self.assertEqual(self.service.connection, "restart-uncertain")
+        self.assertEqual(self.service.error, "版本尚未核实")
+        self.assertIn("acceleration", self.service.latest)
+
     def test_agent_trajectory_shared_state_exports_and_generation_reset(self):
         self.service.source = "live"
         gravity = 9.80665
@@ -83,6 +96,12 @@ class ServiceTests(unittest.TestCase):
         for kind in ("csv", "mat", "xlsx"):
             content, _ = self.service.trajectory_export(kind)
             self.assertTrue(content)
+        self.service._perform("trajectory.options", {"referenceAccelerationStd": .5})
+        tolerance_reset = self.service.trajectory_data(data["total"], data["epoch"])
+        self.assertGreater(tolerance_reset["epoch"], data["epoch"])
+        self.assertEqual(tolerance_reset["points"], [])
+        self.assertIsNone(tolerance_reset["status"]["reference"])
+        self.assertEqual(tolerance_reset["generation"], data["generation"])
         self.service._invalidate_reference()
         reset = self.service.trajectory_data(data["total"], data["epoch"])
         self.assertEqual(reset["points"], [])

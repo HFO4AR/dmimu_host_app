@@ -242,7 +242,7 @@ class Service(FirmwareRuntime):
         times = self.receive_times.setdefault(frame.channel, deque(maxlen=2000))
         times.append(stamp)
         self.history.append(item)
-        if self.source == "live":
+        if self.source == "live" and self.connection not in {"restart-uncertain", "firmware-uncertain"}:
             self.connection = "streaming"
             self.error = None
         return item
@@ -336,7 +336,7 @@ class Service(FirmwareRuntime):
                         self._ingest(raw, time.time(), link)
                     with self.lock:
                         latest_time = max((v["updated_at"] for v in self.latest.values()), default=self.connected_at)
-                        if not (self.firmware_reserved or self.device_restarting) and time.time() - latest_time > 2:
+                        if not (self.firmware_reserved or self.device_restarting) and self.connection not in {"restart-uncertain", "firmware-uncertain"} and time.time() - latest_time > 2:
                             self.connection = "no-data"
                             self.error = "串口已打开，但超过两秒没有有效数据；检查输出接口、通道和固件配置"
                 elif source == "demo":
@@ -479,7 +479,10 @@ class Service(FirmwareRuntime):
                 if action in {"trajectory.reference", "trajectory.start"} and self.source == "playback" and self.playback and not self.playback["playing"]:
                     raise Fault("PLAYBACK_PAUSED", "先开始回放，再建立参考或继续追踪", 409)
                 if action == "trajectory.options":
+                    previous = self.trajectory.snapshot().get("referenceOptions")
                     self.trajectory.set_options(p)
+                    if self.trajectory.snapshot().get("referenceOptions") != previous:
+                        self.trajectory_epoch += 1
                 else:
                     if p: raise ValueError("此轨迹动作不接受参数")
                     if action == "trajectory.reference":

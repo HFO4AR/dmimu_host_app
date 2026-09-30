@@ -130,6 +130,8 @@ python3 agent_cli.py action trajectory.reset --idempotency-key trajectory-reset-
 
 先固定模块，在live或播放中的recorded数据上建立静止参考；status.trajectory.reference有效后再start。reference/start的命令成功不代表已有有效轨迹点，检查active/calibrating/referenceProgress/message。没有外部位置真值不能声称绝对定位精度。零速更新假设实际静止，匀速平移可能被误判，options可关闭。
 
+参考使用稳健窗口，少量噪声尖峰不清零进度。`status.trajectory.referenceOptions` 是当前容差，`referenceQuality` 提供样本数、内点噪声和拒绝原因。`trajectory.options` 可按 [轨迹说明](TRAJECTORY.md) 设置参考容差；数值须使用 API 的 rad/s、m/s²、秒和 0–1 比例，网页上的 °/s、百分比不能直接照抄。修改参考参数会清空参考和轨迹，先导出；它不改变 ZUPT 阈值，也不校准模块。
+
 `GET /api/agent/v1/trajectory?after=INDEX&epoch=EPOCH`提供增量点与状态；epoch改变时清空客户端缓存。`GET /api/agent/v1/trajectory/csv|mat|xlsx`只读导出服务当前点集。POST离线导出仍接受source、generation、原始时基与estimate=true；不能用离线文件代替正在运行任务状态。
 
 ## 固件

@@ -16,12 +16,14 @@ export function rotateVector(v,q) {
   const [w,x,y,z]=q,[a,b,c]=v;
   return [(1-2*(y*y+z*z))*a+2*(x*y-z*w)*b+2*(x*z+y*w)*c,2*(x*y+z*w)*a+(1-2*(x*x+z*z))*b+2*(y*z-x*w)*c,2*(x*z-y*w)*a+2*(y*z+x*w)*b+(1-2*(x*x+y*y))*c];
 }
-const settings = {maxGap:.1,maxAttitudeAge:.05,referenceSeconds:2,referenceSamples:50,maxReferenceWait:30,stillGyro:.035,stillAcceleration:.12,stillSeconds:.35,maxSeconds:120,maxPoints:12000,pointPeriod:.01};
+const percentile=(values,fraction)=>{const ordered=values.slice().sort((a,b)=>a-b),offset=(ordered.length-1)*fraction,low=Math.floor(offset),high=Math.ceil(offset);return ordered[low]+(ordered[high]-ordered[low])*(offset-low);};
+const referenceRanges={referenceGyroMax:[.01,1],referenceAccelerationStd:[.02,3],referenceOutlierFraction:[0,.2],referenceSeconds:[1,10]};
+const settings = {maxGap:.1,maxAttitudeAge:.05,referenceSeconds:2,referenceSamples:50,maxReferenceWait:30,referenceGyroMax:.15,referenceAccelerationStd:.35,referenceOutlierFraction:.10,stillGyro:.035,stillAcceleration:.12,stillSeconds:.35,maxSeconds:120,maxPoints:12000,pointPeriod:.01};
 
 export class TrajectoryEstimator {
   constructor(options={}) {this.options={...settings,...options};this.zupt=true;this.source='none';this.generation=-1;this.reset();}
   reset() {
-    this.active=false;this.calibrating=false;this.reference=null;this.referenceWindow=[];this.referenceStarted=null;this.referenceProgress=0;
+    this.active=false;this.calibrating=false;this.reference=null;this.referenceWindow=[];this.referenceStarted=null;this.referenceProgress=0;this.referenceQuality=null;this.referenceEvaluated=null;
     this.position=[0,0,0];this.velocity=[0,0,0];this.linear=[0,0,0];this.distance=0;this.points=[];this.last=null;this.origin=null;this.segment=0;this.stationary=false;this.stillSince=null;
     this.q=null;this.euler=null;this.gyro=null;this.orientation=null;this.orientationKind='none';this.lastSeen=null;this.lastPointTime=null;this.coalesced=0;this.skipped=0;this.accepted=0;this.gaps=0;
     this.message='先保持模块静止，建立参考';this.timeBasis=this.source==='playback'?'recorded_time':'host_receive_time';
@@ -30,8 +32,18 @@ export class TrajectoryEstimator {
     if(this.source===source&&this.generation===generation)return false;
     this.source=source;this.generation=generation;this.reset();this.message='数据源已变化；轨迹已清空，请重新建立静止参考';return true;
   }
+  setOptions(options){
+    if(!options||typeof options!=='object'||Array.isArray(options)||!Object.keys(options).length||Object.keys(options).some(k=>k!=='zupt'&&!(k in referenceRanges)))throw Error('无效的轨迹选项');
+    if('zupt' in options&&typeof options.zupt!=='boolean')throw Error('zupt 必须为布尔值');
+    for(const [name,[low,high]] of Object.entries(referenceRanges))if(name in options&&(typeof options[name]!=='number'||!Number.isFinite(options[name])||options[name]<low||options[name]>high))throw Error(name+' 数值超出范围');
+    const changed=Object.keys(referenceRanges).some(k=>k in options&&options[k]!==this.options[k]);
+    for(const k of Object.keys(referenceRanges))if(k in options)this.options[k]=options[k];
+    if('zupt' in options){this.zupt=options.zupt;this.stillSince=null;this.stationary=false;}
+    if(changed){this.reset();this.message='静止参考选项已变化；轨迹已清空，请重新建立参考';}
+    return {zupt:this.zupt,...Object.fromEntries(Object.keys(referenceRanges).map(k=>[k,this.options[k]]))};
+  }
   beginReference() {
-    this.reset();this.calibrating=true;this.message='保持静止至少 2 秒；这是上位机估计，不修改模块校准';
+    this.reset();this.calibrating=true;this.message=`保持静止至少 ${this.options.referenceSeconds} 秒；这是上位机估计，不修改模块校准`;
   }
   start() {
     if(!this.reference || this.source==='none'){this.message='先选择数据源并建立静止参考';return false;}
@@ -92,18 +104,30 @@ export class TrajectoryEstimator {
   captureReference(t,world,gyro) {
     if(this.referenceStarted===null)this.referenceStarted=t;
     if(t-this.referenceStarted>this.options.maxReferenceWait){this.pause('30 秒内未获得稳定参考；检查加速度、角速度和姿态通道');return;}
-    const mag=norm(world),aligned=world[2]>0&&world[2]/mag>Math.cos(15*Math.PI/180);
-    if(gyro===null||gyro>this.options.stillGyro||Math.abs(mag-GRAVITY)>.6||!aligned){this.referenceWindow=[];this.referenceProgress=0;this.message=gyro===null?'等待同一从机的角速度数据':!aligned?'世界重力方向不符合 +Z 约定；请核对姿态和安装方向':'检测到运动，请保持模块静止';return;}
+    if(gyro===null){this.referenceWindow=[];this.referenceProgress=0;this.referenceQuality={ready:false,reason:'missing_gyro',samples:0,elapsed:0};this.message='等待同一从机的角速度数据';return;}
     if(this.referenceWindow.length&&t-this.referenceWindow.at(-1).time>this.options.maxGap)this.referenceWindow=[];
-    if(this.referenceWindow.length) {
-      const mean=this.referenceWindow[0].world;
-      if(norm(world.map((v,i)=>v-mean[i]))>.15){this.referenceWindow=[];this.referenceProgress=0;this.message='加速度不稳定，重新累计静止时间';}
-    }
-    this.referenceWindow.push({time:t,world});
-    const elapsed=t-this.referenceWindow[0].time;this.referenceProgress=Math.min(1,elapsed/this.options.referenceSeconds);
-    if(elapsed<this.options.referenceSeconds||this.referenceWindow.length<this.options.referenceSamples)return;
-    this.reference=world.map((_,i)=>this.referenceWindow.reduce((sum,r)=>sum+r.world[i],0)/this.referenceWindow.length);
-    this.referenceMagnitude=norm(this.reference);this.referenceWindow=[];this.calibrating=false;this.referenceProgress=1;this.message='静止参考已建立；点击开始追踪。参考只适用于本次短时估计';
+    this.referenceWindow.push({time:t,world,gyro});
+    if(this.referenceEvaluated!==null&&t-this.referenceEvaluated<.1-1e-9)return;
+    this.referenceEvaluated=t;
+    const cutoff=t-this.options.referenceSeconds;let first=0;
+    while(first+1<this.referenceWindow.length&&this.referenceWindow[first+1].time<=cutoff)first++;
+    this.referenceWindow=this.referenceWindow.slice(first).slice(-30000);
+    const window=this.referenceWindow,elapsed=t-window[0].time;this.referenceProgress=Math.min(1,elapsed/this.options.referenceSeconds);
+    const center=[0,1,2].map(i=>percentile(window.map(r=>r.world[i]),.5)),residual=window.map(r=>norm(r.world.map((v,i)=>v-center[i])));
+    const threshold=Math.max(3*this.options.referenceAccelerationStd,6*percentile(residual,.5),.05);
+    const inliers=window.filter((r,i)=>residual[i]<=threshold&&r.gyro<=this.options.referenceGyroMax),fraction=1-inliers.length/window.length;
+    const mean=inliers.length?[0,1,2].map(i=>inliers.reduce((a,r)=>a+r.world[i],0)/inliers.length):center;
+    const rms=inliers.length?Math.sqrt(inliers.reduce((a,r)=>a+r.world.reduce((b,v,i)=>b+(v-mean[i])**2,0),0)/inliers.length):null;
+    const gyroP95=inliers.length?percentile(inliers.map(r=>r.gyro),.95):null,half=(window[0].time+t)/2;
+    const halves=[true,false].map(before=>inliers.filter(r=>(r.time<half)===before));
+    const means=halves.filter(part=>part.length).map(part=>[0,1,2].map(i=>part.reduce((a,r)=>a+r.world[i],0)/part.length));
+    const shift=means.length===2?norm(means[1].map((v,i)=>v-means[0][i])):null,magnitude=norm(mean);
+    const aligned=magnitude>0&&mean[2]>0&&mean[2]/magnitude>Math.cos(15*Math.PI/180);
+    const reason=elapsed+1e-9<this.options.referenceSeconds?'window':fraction>this.options.referenceOutlierFraction+1e-12?'outliers':inliers.length<this.options.referenceSamples?'window':!aligned?'gravity_direction':Math.abs(magnitude-GRAVITY)>.6?'gravity_magnitude':rms===null||rms>this.options.referenceAccelerationStd?'acceleration_noise':shift===null||shift>this.options.referenceAccelerationStd?'motion_trend':'ready';
+    this.referenceQuality={ready:reason==='ready',reason,samples:window.length,inliers:inliers.length,elapsed,accelerationRms:rms,gyroP95,outlierFraction:fraction,meanShift:shift,gravityMagnitude:magnitude};
+    const messages={window:'正在累计静止窗口；少量尖峰不会清零进度',outliers:'窗口中运动或尖峰过多，请保持模块静止',gravity_direction:'世界重力方向不符合 +Z 约定；请核对姿态和安装方向',gravity_magnitude:'平均加速度偏离重力，请保持静止并核对量纲',acceleration_noise:'窗口加速度噪声过大；保持静止或调整参考噪声阈值',motion_trend:'窗口前后加速度变化明显，请保持模块静止'};
+    if(reason!=='ready'){this.message=messages[reason];return;}
+    this.reference=mean;this.referenceMagnitude=norm(mean);this.referenceWindow=[];this.calibrating=false;this.referenceProgress=1;this.message='静止参考已建立；点击开始追踪。参考只适用于本次短时估计';
   }
   appendPoint(time,hostTime) {
     if(this.lastPointTime!==null&&time-this.lastPointTime<this.options.pointPeriod&&!this.stationary)return;
@@ -111,6 +135,6 @@ export class TrajectoryEstimator {
     this.lastPointTime=time;
     this.points.push({time,host_time:hostTime,elapsed:time-this.origin,segment:this.segment,position:this.position.slice(),velocity:this.velocity.slice(),acceleration:this.linear.slice(),distance:this.distance,stationary:this.stationary,orientation_kind:this.orientationKind,quaternion:this.orientation.slice()});
   }
-  snapshot() {return {active:this.active,calibrating:this.calibrating,reference:this.reference?.slice()||null,referenceProgress:this.referenceProgress,position:this.position.slice(),velocity:this.velocity.slice(),acceleration:this.linear.slice(),distance:this.distance,elapsed:this.points.at(-1)?.elapsed||0,stationary:this.stationary,source:this.source,generation:this.generation,points:this.points.length,coalesced:this.coalesced,skipped:this.skipped,gaps:this.gaps,message:this.message,timeBasis:this.timeBasis,orientationKind:this.orientationKind};}
+  snapshot() {return {active:this.active,calibrating:this.calibrating,reference:this.reference?.slice()||null,referenceProgress:this.referenceProgress,position:this.position.slice(),velocity:this.velocity.slice(),acceleration:this.linear.slice(),distance:this.distance,elapsed:this.points.at(-1)?.elapsed||0,stationary:this.stationary,source:this.source,generation:this.generation,points:this.points.length,coalesced:this.coalesced,skipped:this.skipped,gaps:this.gaps,message:this.message,timeBasis:this.timeBasis,orientationKind:this.orientationKind,zupt:this.zupt,referenceOptions:Object.fromEntries(Object.keys(referenceRanges).map(k=>[k,this.options[k]])),referenceQuality:this.referenceQuality?structuredClone(this.referenceQuality):null};}
   exportPayload(format) {return {format,source:this.source,generation:this.generation,gravity_reference:this.reference?.slice()||[0,0,GRAVITY],timing:this.timeBasis,estimate:true,points:this.points.map(p=>({...p,position:p.position.slice(),velocity:p.velocity.slice(),acceleration:p.acceleration.slice(),quaternion:p.quaternion.slice()}))};}
 }

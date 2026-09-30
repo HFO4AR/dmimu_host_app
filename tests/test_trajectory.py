@@ -211,6 +211,74 @@ class TrajectoryTests(unittest.TestCase):
         self.assertFalse(duration.active)
         self.assertEqual(len(duration.points), 1)
 
+    def test_high_rate_heavy_tailed_static_noise_and_first_sample_spike(self):
+        engine = TrajectoryEstimator()
+        engine.set_source("live", 1)
+        engine.begin_reference()
+        # Fully synthetic 2 kHz USB-group timestamps with a noisy tail and 1%
+        # large bursts. Do not include captured device measurements in tests.
+        for i in range(5001):
+            tail = .8 * math.sin(i * 1.7) if i % 20 == 0 else 0
+            a = [.13 * math.sin(i * .7) + tail, .09 * math.cos(i * .9), GRAVITY + .08 * math.sin(i * .3)]
+            g = [.025 + .05 * math.sin(i * .4) ** 2, 0, 0]
+            if i % 101 == 0:
+                a[0], g[0] = 23, .39
+            engine.consume(samples(1000 + i * .0005, a, gyro=g))
+        self.assertIsNotNone(engine.reference)
+        self.vector_close(engine.reference, [0, 0, GRAVITY], places=2)
+        quality = engine.snapshot()["referenceQuality"]
+        self.assertTrue(quality["ready"])
+        self.assertGreater(quality["samples"], 3900)
+        self.assertLess(quality["outlierFraction"], .10)
+        self.assertLess(quality["accelerationRms"], .35)
+        self.assertEqual(engine.options["stillGyro"], .035)
+        self.assertEqual(engine.options["stillAcceleration"], .12)
+
+    def test_reference_motion_noise_and_contamination_rejected_then_recovers(self):
+        for kind in ("rotation", "shake", "slow_trend", "bursts"):
+            engine = TrajectoryEstimator()
+            engine.set_source("live", 1)
+            engine.begin_reference()
+            for i in range(251):
+                t = i * .01
+                x = .8 * math.sin(t * 12) if kind == "shake" else .6 * t if kind == "slow_trend" else 23 if kind == "bursts" and i % 3 == 0 else 0
+                engine.consume(samples(1000 + t, [x, 0, GRAVITY], gyro=[.5 if kind == "rotation" else 0, 0, 0]))
+            self.assertIsNone(engine.reference, kind)
+            self.assertFalse(engine.snapshot()["referenceQuality"]["ready"])
+            # A rolling window heals after motion leaves it, without re-clicking.
+            for i in range(231):
+                engine.consume(samples(1002.51 + i * .01))
+            self.assertIsNotNone(engine.reference, kind)
+
+    def test_reference_options_ranges_partial_updates_reset_and_private_quality(self):
+        engine = self.calibrated()
+        engine.start()
+        engine.consume(samples(1003))
+        for invalid in ({}, {"other": 1}, {"referenceGyroMax": True}, {"referenceAccelerationStd": math.nan},
+                        {"referenceOutlierFraction": .21}, {"referenceSeconds": .9}, {"referenceSeconds": 11},
+                        {"referenceGyroMax": .009}, {"referenceAccelerationStd": 3.01}, {"zupt": 1}):
+            before = engine.snapshot()
+            with self.assertRaises(ValueError):
+                engine.set_options(invalid)
+            self.assertEqual(engine.snapshot()["referenceOptions"], before["referenceOptions"])
+            self.assertTrue(engine.active)
+        engine.set_options({"zupt": False})
+        self.assertTrue(engine.active)
+        engine.set_options({"referenceGyroMax": .2, "referenceAccelerationStd": .5, "referenceOutlierFraction": .15, "referenceSeconds": 1})
+        self.assertIsNone(engine.reference)
+        self.assertFalse(engine.active)
+        self.assertEqual(engine.points, [])
+        engine.begin_reference()
+        for i in range(111):
+            engine.consume(samples(1004 + i * .01))
+        self.assertIsNotNone(engine.reference)
+        snapshot = engine.snapshot()
+        snapshot["referenceQuality"]["reason"] = "changed"
+        snapshot["referenceOptions"]["referenceSeconds"] = 99
+        self.assertEqual(engine.snapshot()["referenceQuality"]["reason"], "ready")
+        self.assertEqual(engine.options["referenceSeconds"], 1)
+        self.assertFalse(engine.zupt)
+
     def test_export_payload_is_private_copy_and_three_formats(self):
         engine = self.calibrated()
         engine.start()

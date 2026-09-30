@@ -10,7 +10,8 @@ import time
 
 GRAVITY = 9.80665
 DEFAULTS = {"maxGap": .1, "maxAttitudeAge": .05, "referenceSeconds": 2,
-            "referenceSamples": 50, "maxReferenceWait": 30, "stillGyro": .035,
+            "referenceSamples": 50, "maxReferenceWait": 30, "referenceGyroMax": .15,
+            "referenceAccelerationStd": .35, "referenceOutlierFraction": .10, "stillGyro": .035,
             "stillAcceleration": .12, "stillSeconds": .35, "maxSeconds": 120,
             "maxPoints": 12000, "pointPeriod": .01}
 
@@ -27,6 +28,17 @@ def _vector(value):
 
 def _norm(vector):
     return math.hypot(*vector)
+
+
+def _percentile(values, fraction):
+    ordered = sorted(values)
+    offset = (len(ordered) - 1) * fraction
+    low, high = math.floor(offset), math.ceil(offset)
+    return ordered[low] + (ordered[high] - ordered[low]) * (offset - low)
+
+
+REFERENCE_RANGES = {"referenceGyroMax": (.01, 1), "referenceAccelerationStd": (.02, 3),
+                    "referenceOutlierFraction": (0, .2), "referenceSeconds": (1, 10)}
 
 
 def normalize_quaternion(value):
@@ -75,6 +87,8 @@ class TrajectoryEstimator:
         self.reference_window = []
         self.reference_started = None
         self.reference_progress = 0
+        self.reference_quality = None
+        self._reference_evaluated = None
         self.position, self.velocity, self.linear = [0., 0., 0.], [0., 0., 0.], [0., 0., 0.]
         self.distance, self.points, self.last, self.origin, self.segment = 0., [], None, None, 0
         self.stationary, self.still_since = False, None
@@ -96,11 +110,22 @@ class TrajectoryEstimator:
         return True
 
     def set_options(self, options):
-        if not isinstance(options, dict) or set(options) != {"zupt"} or type(options["zupt"]) is not bool:
-            raise ValueError("轨迹选项仅接受布尔值 zupt")
-        self.zupt = options["zupt"]
-        self.still_since, self.stationary = None, False
-        return {"zupt": self.zupt}
+        if not isinstance(options, dict) or not options or set(options) - ({"zupt"} | set(REFERENCE_RANGES)):
+            raise ValueError("无效的轨迹选项")
+        if "zupt" in options and type(options["zupt"]) is not bool:
+            raise ValueError("zupt 必须为布尔值")
+        for name, (low, high) in REFERENCE_RANGES.items():
+            if name in options and (not _finite(options[name]) or not low <= options[name] <= high):
+                raise ValueError(f"{name} 必须为 {low}..{high} 范围内的数值")
+        changed = any(name in options and options[name] != self.options[name] for name in REFERENCE_RANGES)
+        self.options.update({name: value for name, value in options.items() if name in REFERENCE_RANGES})
+        if "zupt" in options:
+            self.zupt = options["zupt"]
+            self.still_since, self.stationary = None, False
+        if changed:
+            self.reset()
+            self.message = "静止参考选项已变化；轨迹已清空，请重新建立参考"
+        return {"zupt": self.zupt, **{name: self.options[name] for name in REFERENCE_RANGES}}
 
     def begin_reference(self):
         if self.source == "none":
@@ -108,7 +133,7 @@ class TrajectoryEstimator:
         self.reset()
         self.calibrating = True
         self._last_activity = self._clock()
-        self.message = "保持静止至少 2 秒；这是上位机估计，不修改模块校准"
+        self.message = f"保持静止至少 {self.options['referenceSeconds']:g} 秒；这是上位机估计，不修改模块校准"
 
     def start(self):
         if not self.reference or self.source == "none":
@@ -262,26 +287,63 @@ class TrajectoryEstimator:
         if stamp - self.reference_started > self.options["maxReferenceWait"]:
             self.pause("30 秒内未获得稳定参考；检查加速度、角速度和姿态通道")
             return
-        magnitude = _norm(world)
-        aligned = world[2] > 0 and world[2] / magnitude > math.cos(15 * math.pi / 180)
-        if gyro is None or gyro > self.options["stillGyro"] or abs(magnitude - GRAVITY) > .6 or not aligned:
+        if gyro is None:
             self.reference_window, self.reference_progress = [], 0
-            self.message = ("等待同一从机的角速度数据" if gyro is None else
-                            "世界重力方向不符合 +Z 约定；请核对姿态和安装方向" if not aligned else "检测到运动，请保持模块静止")
+            self.reference_quality = {"ready": False, "reason": "missing_gyro", "samples": 0, "elapsed": 0}
+            self.message = "等待同一从机的角速度数据"
             return
         if self.reference_window and stamp - self.reference_window[-1]["time"] > self.options["maxGap"]:
             self.reference_window = []
-        if self.reference_window:
-            initial = self.reference_window[0]["world"]
-            if _norm([v - initial[i] for i, v in enumerate(world)]) > .15:
-                self.reference_window, self.reference_progress = [], 0
-                self.message = "加速度不稳定，重新累计静止时间"
-        self.reference_window.append({"time": stamp, "world": world})
-        elapsed = stamp - self.reference_window[0]["time"]
-        self.reference_progress = min(1, elapsed / self.options["referenceSeconds"])
-        if elapsed < self.options["referenceSeconds"] or len(self.reference_window) < self.options["referenceSamples"]:
+        self.reference_window.append({"time": stamp, "world": world, "gyro": gyro})
+        # Keep one sample immediately before the cutoff, preserving full time
+        # coverage despite irregular USB chunks. Evaluate at 10 Hz, not per frame.
+        cutoff = stamp - self.options["referenceSeconds"]
+        if self._reference_evaluated is not None and stamp - self._reference_evaluated < .1 - 1e-9:
             return
-        self.reference = [sum(row["world"][i] for row in self.reference_window) / len(self.reference_window) for i in range(3)]
+        self._reference_evaluated = stamp
+        first = 0
+        while first + 1 < len(self.reference_window) and self.reference_window[first + 1]["time"] <= cutoff:
+            first += 1
+        self.reference_window = self.reference_window[first:][-30000:]
+        window = self.reference_window
+        elapsed = stamp - window[0]["time"]
+        self.reference_progress = min(1., elapsed / self.options["referenceSeconds"])
+        center = [_percentile([row["world"][i] for row in window], .5) for i in range(3)]
+        residual = [_norm([row["world"][i] - center[i] for i in range(3)]) for row in window]
+        # Robust scale catches isolated acceleration bursts without letting a
+        # single first sample restart the entire two-second reference window.
+        threshold = max(3 * self.options["referenceAccelerationStd"], 6 * _percentile(residual, .5), .05)
+        inliers = [row for row, distance in zip(window, residual)
+                   if distance <= threshold and row["gyro"] <= self.options["referenceGyroMax"]]
+        fraction = 1 - len(inliers) / len(window)
+        mean = [sum(row["world"][i] for row in inliers) / len(inliers) for i in range(3)] if inliers else center
+        rms = math.sqrt(sum(sum((row["world"][i] - mean[i]) ** 2 for i in range(3)) for row in inliers) / len(inliers)) if inliers else None
+        gyro_p95 = _percentile([row["gyro"] for row in inliers], .95) if inliers else None
+        half = (window[0]["time"] + stamp) / 2
+        halves = [[row for row in inliers if (row["time"] < half) == before] for before in (True, False)]
+        means = [[sum(row["world"][i] for row in part) / len(part) for i in range(3)] for part in halves if part]
+        shift = _norm([means[1][i] - means[0][i] for i in range(3)]) if len(means) == 2 else None
+        magnitude = _norm(mean)
+        aligned = magnitude > 0 and mean[2] > 0 and mean[2] / magnitude > math.cos(15 * math.pi / 180)
+        reason = ("window" if elapsed + 1e-9 < self.options["referenceSeconds"] else
+                  "outliers" if fraction > self.options["referenceOutlierFraction"] + 1e-12 else
+                  "window" if len(inliers) < self.options["referenceSamples"] else
+                  "gravity_direction" if not aligned else "gravity_magnitude" if abs(magnitude - GRAVITY) > .6 else
+                  "acceleration_noise" if rms is None or rms > self.options["referenceAccelerationStd"] else
+                  "motion_trend" if shift is None or shift > self.options["referenceAccelerationStd"] else "ready")
+        self.reference_quality = {"ready": reason == "ready", "reason": reason, "samples": len(window),
+                                  "inliers": len(inliers), "elapsed": elapsed, "accelerationRms": rms,
+                                  "gyroP95": gyro_p95, "outlierFraction": fraction, "meanShift": shift,
+                                  "gravityMagnitude": magnitude}
+        messages = {"window": "正在累计静止窗口；少量尖峰不会清零进度", "outliers": "窗口中运动或尖峰过多，请保持模块静止",
+                    "gravity_direction": "世界重力方向不符合 +Z 约定；请核对姿态和安装方向",
+                    "gravity_magnitude": "平均加速度偏离重力，请保持静止并核对量纲",
+                    "acceleration_noise": "窗口加速度噪声过大；保持静止或调整参考噪声阈值",
+                    "motion_trend": "窗口前后加速度变化明显，请保持模块静止"}
+        if reason != "ready":
+            self.message = messages[reason]
+            return
+        self.reference = mean
         self.reference_window, self.calibrating, self.reference_progress = [], False, 1
         self.message = "静止参考已建立；点击开始追踪。参考只适用于本次短时估计"
 
@@ -301,7 +363,9 @@ class TrajectoryEstimator:
                 "acceleration": self.linear.copy(), "distance": self.distance, "elapsed": self.points[-1]["elapsed"] if self.points else 0,
                 "stationary": self.stationary, "source": self.source, "generation": self.generation, "points": len(self.points),
                 "coalesced": self.coalesced, "skipped": self.skipped, "gaps": self.gaps, "message": self.message,
-                "timeBasis": self.time_basis, "orientationKind": self.orientation_kind, "zupt": self.zupt}
+                "timeBasis": self.time_basis, "orientationKind": self.orientation_kind, "zupt": self.zupt,
+                "referenceOptions": {name: self.options[name] for name in REFERENCE_RANGES},
+                "referenceQuality": copy.deepcopy(self.reference_quality)}
 
     def export_payload(self, format):
         if format not in {"mat", "xlsx", "csv"}:

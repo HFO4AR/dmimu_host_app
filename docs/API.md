@@ -55,7 +55,7 @@
 | allan.analyze | recording_id、channel（acceleration/angular_velocity）、sample_rate |
 | allan.cancel | `{"operation_id":"ANALYSIS_OPERATION_ID"}` |
 | trajectory.reference / trajectory.start / trajectory.pause / trajectory.reset | `{}`，上位机估计，不发送设备指令 |
-| trajectory.options | `{"zupt":true或false}` |
+| trajectory.options | `zupt` 与 `referenceGyroMax`、`referenceAccelerationStd`、`referenceOutlierFraction`、`referenceSeconds` 的非空子集；范围见 [轨迹说明](TRAJECTORY.md)，参考项变更清空参考/轨迹并递增 epoch |
 | firmware.inspect | `{"id":"FIRMWARE_ID"}` |
 | firmware.upgrade | id、acknowledged=true、expected_version、expected_identity |
 | firmware.cancel | `{"operation_id":"UPGRADE_OPERATION_ID"}` |

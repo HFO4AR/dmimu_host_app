@@ -18,7 +18,7 @@
 
 - 输入加速度单位 m/s²，角速度 rad/s；四元数按 `[w,x,y,z]` 规范化。欧拉角输入度，使用 `Rz(yaw) Ry(pitch) Rx(roll)`。
 - 世界加速度 `a_world = R(q) a_body`。世界 +Z 朝上，静止比力默认约定为 +Z。可视化通过 proper rotation `X→X、Y→−Z、Z→Y` 变换到 Three.js 的 Y-up；积分保持原始世界 XYZ。
-- 静止参考取稳定窗口中 `a_world` 的平均向量。角速度模长必须小于 0.035 rad/s，重力模长与标准值相差不超过 0.6 m/s²，方向偏离世界 +Z 小于 15°，窗口内加速度变化不超过 0.15 m/s²；时间至少 2 秒、至少 50 个不同时间样本。
+- 静止参考取稳健窗口内点的 `a_world` 平均向量。默认角速度容差 0.15 rad/s、内点加速度 RMS 容差 0.35 m/s²、允许最多 10% 离群样本；平均重力模长与标准值相差不超过 0.6 m/s²，方向偏离世界 +Z 小于 15°。默认至少 2 秒、50 个有效时间样本；容差可调，详见下表。
 - 这个单姿态参考不能区分重力、安装误差和体坐标加速度零偏，也不是三轴偏置校准。它只补偿本次窗口里的静止世界参考；改变温度、姿态、量程或设备校准后，参考可能不再适用。
 - 去重力加速度 `a_linear = a_world - gravity_reference`；速度与位移使用梯形平均加速度积分。位置初值与速度初值由用户声明为零，没有从其他传感器估计真实初始速度。
 - 静止零速更新默认打开：去重力加速度模长小于 0.12 m/s²、角速度小于 0.035 rad/s，持续至少 0.35 秒时把速度置零。**六轴 IMU 无法区分静止和无转动的匀速平移**，所以这个假设会误判匀速运动；需要追踪该类运动时关闭自动零速。
@@ -35,7 +35,22 @@
 
 ## 导出接口
 
-Service是运行中唯一估计器，网页和Agent读取同一状态。`trajectory.reference/start/pause/reset`接受空参数，`trajectory.options`接受 `{"zupt":true或false}`。操作不写硬件，沿用已有队列/幂等恢复。关闭网页不停止已启动追踪，服务持续接收和估计。
+Service是运行中唯一估计器，网页和Agent读取同一状态。`trajectory.reference/start/pause/reset`接受空参数。`trajectory.options` 接受 `zupt` 和下述参考容差的非空子集；修改参考容差会清空参考和轨迹并增加 epoch，修改 `zupt` 不清空点集。操作不写硬件，沿用已有队列/幂等恢复。关闭网页不停止已启动追踪，服务持续接收和估计。
+
+参考建立改用滚动窗口，每 100 ms 评估一次，不因单个噪声尖峰清零。用世界加速度分量中位数估计中心，剔除距离过大或角速度超过容差的样本；内点 RMS、前后半窗均值变化和平均重力约定须满足条件。持续移动与姿态/时间缺口仍会拒绝参考。少量被剔除的尖峰不等于采集丢帧。
+
+| 选项 | 默认 | 范围 / 单位 |
+| --- | --- | --- |
+| `referenceGyroMax` | 0.15 | 0.01–1 rad/s，超出值计入离群样本 |
+| `referenceAccelerationStd` | 0.35 | 0.02–3 m/s²，内点向量 RMS 和前后均值变化上限 |
+| `referenceOutlierFraction` | 0.10 | 0–0.20，最大离群比例 |
+| `referenceSeconds` | 2 | 1–10 s，至少 50 个有效样本 |
+
+网页提供普通、低噪声、振动较大预设和自定义字段；角速度字段显示 °/s，API 使用 rad/s。`referenceOptions` 回报当前生效设置，`referenceQuality` 回报样本数、内点 RMS、内点角速度 P95、离群比例、前后均值变化和具体拒绝原因。参考阈值与追踪时的零速更新阈值独立，放宽参考不放宽 ZUPT。窗口最多保留 30000 个参考样本；高频且选择长窗口时应降低输出频率或缩短窗口。
+
+```sh
+python agent_cli.py action trajectory.options --params '{"referenceGyroMax":0.15,"referenceAccelerationStd":0.35,"referenceOutlierFraction":0.1,"referenceSeconds":2}' --idempotency-key reference-tolerance-001
+```
 
 `GET /api/v1/trajectory?after=INDEX&epoch=EPOCH`返回status、epoch、points、offset、next、total、generation。epoch与当前不匹配时从0返回；reference/reset增加独立epoch，source/generation变化清空点集，消费者必须丢弃旧缓存。status.trajectory也包含当前统计。
 
