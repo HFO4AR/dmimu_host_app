@@ -21,7 +21,9 @@ def private_directory(path):
         quoted = str(path).replace("'", "''")
         script = f"$p='{quoted}'; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User; "
         script += "$a=Get-Acl -LiteralPath $p; $a.SetAccessRuleProtection($true,$false); foreach($r in @($a.Access)){$a.RemoveAccessRuleSpecific($r)}; $a.SetOwner($sid); $a.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow')); Set-Acl -LiteralPath $p -AclObject $a"
-        subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference='Stop';" + script], check=True, capture_output=True)
+        process = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference='Stop';" + script], capture_output=True)
+        if process.returncode:
+            raise RuntimeError("Windows 私有目录 ACL 设置失败：" + process.stderr.decode(errors="replace"))
     else:
         path.chmod(0o700)
         if path.stat().st_mode & 0o077:
