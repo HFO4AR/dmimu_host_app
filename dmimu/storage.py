@@ -7,6 +7,17 @@ import subprocess
 import tempfile
 
 
+def windows_powershell(script):
+    # Python launched from pwsh inherits PS7 module paths, which PS5 cannot load.
+    # Only built-in Windows PowerShell modules are required for ACL operations.
+    env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
+    system = Path(os.environ.get("SystemRoot", "C:\\Windows")) / "System32" / "WindowsPowerShell" / "v1.0"
+    env["PSModulePath"] = str(system / "Modules")
+    process = subprocess.run([str(system / "powershell.exe"), "-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference='Stop';" + script], capture_output=True, env=env)
+    if process.returncode:
+        raise RuntimeError("Windows 私有权限检查失败：" + process.stderr.decode(errors="replace"))
+
+
 def default_directory():
     if os.name == "nt":
         return Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))) / "DM-IMU-Workbench"
@@ -21,9 +32,7 @@ def private_directory(path):
         quoted = str(path).replace("'", "''")
         script = f"$p='{quoted}'; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User; "
         script += "$a=Get-Acl -LiteralPath $p; $a.SetAccessRuleProtection($true,$false); foreach($r in @($a.Access)){$a.RemoveAccessRuleSpecific($r)}; $a.SetOwner($sid); $a.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow')); Set-Acl -LiteralPath $p -AclObject $a"
-        process = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference='Stop';" + script], capture_output=True)
-        if process.returncode:
-            raise RuntimeError("Windows 私有目录 ACL 设置失败：" + process.stderr.decode(errors="replace"))
+        windows_powershell(script)
     else:
         path.chmod(0o700)
         if path.stat().st_mode & 0o077:

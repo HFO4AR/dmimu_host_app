@@ -12,7 +12,7 @@ from urllib.request import Request, urlopen
 import uuid
 import subprocess
 
-from dmimu.storage import default_directory
+from dmimu.storage import default_directory, windows_powershell
 
 ROOT = Path(__file__).resolve().parent
 
@@ -27,13 +27,15 @@ def private_json(path):
         quoted = str(path).replace("'", "''")
         script = f"$p='{quoted}'; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User; $a=Get-Acl -LiteralPath $p; "
         script += "if($a.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid.Value){throw 'Wrong owner'}; foreach($r in $a.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier])){if($r.AccessControlType -eq 'Allow' -and $r.IdentityReference.Value -ne $sid.Value){throw 'Shared access'}}"
-        subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference='Stop';" + script], check=True, capture_output=True)
+        windows_powershell(script)
     if info.st_size > 16384:
         raise ValueError("接入文件过大")
     return json.loads(path.read_text(encoding="utf-8"))
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     p = argparse.ArgumentParser(description="达妙 IMU Agent CLI；全局选项放在子命令前")
     p.add_argument("--host-url")
     p.add_argument("--token-file", type=Path)
@@ -139,7 +141,7 @@ def main():
         if "idempotency_key" in previous:
             output["idempotency_key"] = previous["idempotency_key"]
         exit_code = 2
-    except (OSError, URLError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+    except (OSError, URLError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError) as exc:
         output = (output or {}) | {"ok": False, "error": {"code": "TOKEN_UNAVAILABLE" if isinstance(exc, FileNotFoundError) and args.command != "download" else "CLIENT_ERROR", "message": str(exc)}}
         exit_code = 2
     print(json.dumps(output, ensure_ascii=False, allow_nan=False))
