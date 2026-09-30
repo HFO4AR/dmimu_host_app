@@ -1,0 +1,2 @@
+# Keep upstream vendor distributions byte-for-byte; their whitespace is external.
+static/vendor/* -whitespace
