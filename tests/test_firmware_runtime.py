@@ -1,5 +1,6 @@
 """Firmware integration checks use a fully synthetic serial device only."""
 import json
+import os
 import struct
 import tempfile
 import time
@@ -10,7 +11,7 @@ from dmimu import v2
 from dmimu.firmware import ENTER_UPGRADE, REBOOT
 from dmimu.protocol import crc16
 from dmimu.service import Service, Fault
-from dmimu.storage import Settings
+from dmimu.storage import Settings, windows_powershell
 from dmimu.web import create_app
 from tests.test_service import FakeSerial, port
 
@@ -222,7 +223,13 @@ class FirmwareRuntimeTests(unittest.TestCase):
         uploaded=self.client.post('/api/agent/v1/firmware/upload',data=package(),content_type='application/octet-stream',headers=self.headers|{'X-Firmware-Name':'../../test.bin'})
         data=uploaded.json['data'];self.assertEqual(data['filename'],'test.bin');self.assertTrue(data['upgrade_allowed'])
         self.assertEqual(data['current_version'],'2.0.3.0')
-        self.assertEqual(self.service._firmware_path(data['id']).stat().st_mode&0o077,0)
+        if os.name == 'nt':
+            quoted = str(self.service._firmware_path(data['id'])).replace("'", "''")
+            script = f"$p='{quoted}'; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User; $a=Get-Acl -LiteralPath $p; "
+            script += "if($a.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid.Value){throw 'Wrong owner'}; foreach($r in $a.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier])){if($r.AccessControlType -eq 'Allow' -and $r.IdentityReference.Value -ne $sid.Value){throw 'Shared access'}}"
+            windows_powershell(script)
+        else:
+            self.assertEqual(self.service._firmware_path(data['id']).stat().st_mode&0o077,0)
         listing=self.client.get('/api/agent/v1/firmware',headers=self.headers).json['data']
         self.assertEqual(len(listing),2)
         self.service._firmware_path(data['id']).write_bytes(package(body=b'changed'))

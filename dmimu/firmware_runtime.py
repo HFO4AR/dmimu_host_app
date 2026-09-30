@@ -14,7 +14,7 @@ import time
 import uuid
 
 from .firmware import FirmwareImage, UpgradeSession, MAX_PACKAGE_SIZE, version_tuple, version_string
-from .storage import atomic_json
+from .storage import atomic_json, private_file
 from . import v2
 
 
@@ -56,6 +56,8 @@ class FirmwareRuntime:
                     os.fchmod(fd, 0o600)
                 with os.fdopen(fd, "wb") as stream:
                     stream.write(raw); stream.flush(); os.fsync(stream.fileno())
+                if os.name == "nt":
+                    private_file(temporary)
                 os.replace(temporary, path)
                 metadata = image.inspect() | {"id": identifier, "filename": name, "uploaded_at": time.time()}
                 atomic_json(self._firmware_path(identifier, "json"), metadata)

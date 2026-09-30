@@ -50,12 +50,33 @@ def atomic_json(path, value):
             json.dump(value, out, ensure_ascii=False, allow_nan=False)
             out.flush()
             os.fsync(out.fileno())
+        if os.name == "nt":
+            private_file(name)
         os.replace(name, path)
         if os.name != "nt" and path.stat().st_mode & 0o077:
             raise RuntimeError("配置文件无法保存私有权限，请更换数据目录")
     finally:
         if os.path.exists(name):
             os.unlink(name)
+
+
+def private_file(path):
+    """Set current-user ownership and private ACL before publishing a file.
+
+    Elevated Windows processes can create Administrators-owned files even in
+    a user-owned directory. Inherited grants alone do not set the owner that
+    the Agent credential verifier requires.
+    """
+    path = Path(path)
+    if os.name == "nt":
+        quoted = str(path.resolve()).replace("'", "''")
+        script = f"$p='{quoted}'; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User; "
+        script += "$a=Get-Acl -LiteralPath $p; $a.SetAccessRuleProtection($true,$false); foreach($r in @($a.Access)){$a.RemoveAccessRuleSpecific($r)}; $a.SetOwner($sid); $a.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','Allow')); Set-Acl -LiteralPath $p -AclObject $a"
+        windows_powershell(script)
+    else:
+        path.chmod(0o600)
+        if path.stat().st_mode & 0o077:
+            raise RuntimeError("文件无法保存私有权限，请更换数据目录")
 
 
 class Settings:
